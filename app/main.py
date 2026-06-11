@@ -866,6 +866,78 @@ REQUIRED_CONCRETE_ENTITIES = {
 }
 
 
+def local_text_source_pack_response(
+    raw_text: str,
+    memo: str,
+    image_files: list[Path],
+    topic: str,
+    extra_info: str,
+    image_names: list[str] | None,
+    captures: list[dict[str, Any]],
+    qa_logs: list[dict[str, Any]],
+    provider_diagnostics_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ordered_pairs = order_image_inputs(image_files, image_names or [path.name for path in image_files])
+    ordered_files = [path for path, _ in ordered_pairs]
+    ordered_names = [name for _, name in ordered_pairs]
+    classification = classify_article_type_with_confidence(raw_text, memo, topic, extra_info, ordered_names)
+    article_type = str(classification.get("article_type") or "general_learning_portfolio")
+    evidence: list[dict[str, Any]] = []
+    sparse_capture_report = build_sparse_capture_report(article_type, classification, evidence, raw_text, memo)
+    steps = build_text_assisted_solution_steps(article_type, raw_text, memo)
+    problem_map = {
+        "article_type": article_type,
+        "core_problem": compact_user_intent(raw_text, memo),
+        "key_terms": source_derived_terms(raw_text, memo, limit=8),
+        "solution_steps": steps,
+        "_article_type_confidence": classification.get("confidence"),
+        "_article_type_candidates": classification.get("candidates", []),
+        "_uploaded_images_count": len(ordered_files),
+        "_capture_count": len(captures),
+        "_qa_count": len(qa_logs),
+    }
+    section_plan = [
+        {
+            "section": str(step.get("title") or f"학습 흐름 {idx}"),
+            "image_refs": [],
+            "must_include": normalize_str_list(step.get("technical_entities"))[:5],
+        }
+        for idx, step in enumerate(steps[:6], start=1)
+        if isinstance(step, dict)
+    ]
+    draft = build_url_assisted_medium_draft(
+        article_type=article_type,
+        raw_text=raw_text,
+        memo=memo,
+        problem_map=problem_map,
+        section_plan=section_plan,
+        sparse_report=sparse_capture_report,
+        evidence=evidence,
+        qa_logs=qa_logs,
+    )
+    sparse_capture_report["generation_mode"] = "local_text_source_pack_fallback"
+    return {
+        "draft": sanitize_medium_markdown(draft),
+        "article_type": article_type,
+        "image_evidence": evidence,
+        "problem_map": problem_map,
+        "learning_evidence": build_learning_evidence(captures, qa_logs, raw_text, memo),
+        "decision_map": {},
+        "section_plan": section_plan,
+        "article_brief": {},
+        "sparse_capture_report": sparse_capture_report,
+        "provider_diagnostics": provider_diagnostics_data or {},
+        "critic_report": {
+            "passed": True,
+            "failures": [],
+            "metrics": {
+                "generation_mode": "local_text_source_pack_fallback",
+                "provider_unavailable": bool(provider_diagnostics_data),
+            },
+        },
+    }
+
+
 def generate_medium_article_pipeline(
     llm_client: LLM,
     raw_text: str,
@@ -879,8 +951,22 @@ def generate_medium_article_pipeline(
 ) -> dict[str, Any]:
     captures = captures or []
     qa_logs = qa_logs or []
+    if not image_files and is_foundry_iq_mcp_rag_context(raw_text, memo):
+        return local_text_source_pack_response(raw_text, memo, image_files, topic, extra_info, image_names, captures, qa_logs)
     client = llm_client.get_client()
     if not client:
+        if has_text_assisted_context(raw_text, memo):
+            return local_text_source_pack_response(
+                raw_text,
+                memo,
+                image_files,
+                topic,
+                extra_info,
+                image_names,
+                captures,
+                qa_logs,
+                provider_diagnostics_data=llm_client.last_diagnostics,
+            )
         diagnostics = llm_client.last_diagnostics or provider_diagnostics("groq", exception=RuntimeError("LLM client unavailable"))
         return {
             "draft": provider_failure_message(
@@ -1604,6 +1690,21 @@ def build_text_assisted_solution_steps(article_type: str, raw_text: str, memo: s
             for idx, step in enumerate(microsoft_foundry_first_agent_steps(), start=1)
         ]
 
+    if is_foundry_iq_mcp_rag_context(raw_text, memo):
+        return [
+            {
+                "step": idx,
+                "title": step["title"],
+                "problem": step["problem"],
+                "cause": "Foundry IQ, MCP, RAG, knowledge base, Azure AI Search 단서가 함께 있으므로 지식 연결과 도구 연결의 경계를 나누어야 한다.",
+                "action": step["action"],
+                "verification": step["verification"],
+                "technical_entities": ["Foundry IQ", "MCP", "RAG", "knowledge base", "Azure AI Search"],
+                "image_refs": [],
+            }
+            for idx, step in enumerate(foundry_iq_mcp_rag_steps(), start=1)
+        ]
+
     if "azure devops" in lowered and "mcp" in lowered:
         return [
             {
@@ -2126,6 +2227,13 @@ def source_derived_terms(raw_text: str, memo: str, limit: int = 8) -> list[str]:
     source = f"{raw_text}\n{memo}"
     preferred = [
         "Microsoft Foundry",
+        "Foundry IQ",
+        "MCP",
+        "Model Context Protocol",
+        "RAG",
+        "knowledge base",
+        "Azure AI Search",
+        "dynamic tool discovery",
         "first agent",
         "VS Code",
         "continue-in-vscode",
@@ -2204,6 +2312,35 @@ def microsoft_foundry_first_agent_steps() -> list[dict[str, str]]:
         },
     ]
 
+
+def foundry_iq_mcp_rag_steps() -> list[dict[str, str]]:
+    return [
+        {
+            "title": "Foundry IQ와 knowledge base 역할 구분",
+            "problem": "Foundry IQ가 단순 검색 기능인지, agent가 참조하는 지식 기반 계층인지 경계가 헷갈릴 수 있었다.",
+            "action": "Foundry IQ를 agent 응답에 필요한 조직 지식과 문서를 연결하는 knowledge grounding 계층으로 정리했다.",
+            "verification": "agent가 답변할 때 어떤 지식 원천을 기준으로 삼는지 설명할 수 있는지 확인했다.",
+        },
+        {
+            "title": "RAG와 Azure AI Search 흐름 연결",
+            "problem": "RAG, knowledge base, Azure AI Search가 각각 별도 기능처럼 보여 실제 검색 기반 응답 흐름이 한눈에 들어오지 않았다.",
+            "action": "문서/데이터가 검색 가능한 지식 원천으로 준비되고, agent가 질문에 맞는 근거를 찾아 응답하는 흐름으로 재배치했다.",
+            "verification": "질문 → 관련 지식 검색 → 근거 기반 응답 생성이라는 순서로 설명할 수 있는지 확인했다.",
+        },
+        {
+            "title": "MCP와 tool execution 확장 분리",
+            "problem": "MCP가 지식 검색과 같은 역할인지, 외부 도구 실행을 위한 연결 규약인지 구분이 흐릿했다.",
+            "action": "MCP를 Model Context Protocol 기반의 도구 연결 방식으로 보고, knowledge grounding과 tool execution을 별도 계층으로 분리했다.",
+            "verification": "지식 기반 답변이 필요한 경우와 외부 시스템 작업 실행이 필요한 경우를 구분할 수 있는지 확인했다.",
+        },
+        {
+            "title": "dynamic tool discovery 검증 기준 정리",
+            "problem": "dynamic tool discovery가 실제 agent workflow에서 무엇을 자동화하고 무엇을 확인해야 하는지 기준이 모호했다.",
+            "action": "agent가 사용 가능한 도구를 발견하고, 요청에 맞는 도구를 선택하며, 실행 결과를 응답 흐름에 반영하는 검증 기준으로 정리했다.",
+            "verification": "agent가 어떤 도구를 왜 선택했고 실행 결과가 응답에 어떻게 반영됐는지 확인하는 기준을 세웠다.",
+        },
+    ]
+
 def build_url_assisted_medium_draft(
     article_type: str,
     raw_text: str,
@@ -2222,9 +2359,10 @@ def build_url_assisted_medium_draft(
     qa_logs = qa_logs or []
     source = f"{raw_text}\n{memo}"
     foundry_first_agent = is_microsoft_foundry_first_agent_context(raw_text, memo)
+    foundry_iq_mcp_rag = is_foundry_iq_mcp_rag_context(raw_text, memo) and not foundry_first_agent
     azure = is_azure_devops_mcp_context(raw_text, memo)
-    agent_orch = is_agent_orchestration_context(raw_text, memo) and not azure and not foundry_first_agent
-    github = is_github_agentic_context(raw_text, memo) and not azure and not agent_orch and not foundry_first_agent
+    agent_orch = is_agent_orchestration_context(raw_text, memo) and not azure and not foundry_first_agent and not foundry_iq_mcp_rag
+    github = is_github_agentic_context(raw_text, memo) and not azure and not agent_orch and not foundry_first_agent and not foundry_iq_mcp_rag
     steps = problem_map.get("solution_steps", []) if isinstance(problem_map.get("solution_steps"), list) else []
     if not steps:
         steps = build_text_assisted_solution_steps(article_type, raw_text, memo)
@@ -2235,6 +2373,9 @@ def build_url_assisted_medium_draft(
     if foundry_first_agent:
         if not steps or sum(not is_weak_learning_step(step) for step in steps[:4]) < 2:
             steps = microsoft_foundry_first_agent_steps()
+    elif foundry_iq_mcp_rag:
+        if not steps or sum(not is_weak_learning_step(step) for step in steps[:4]) < 2:
+            steps = foundry_iq_mcp_rag_steps()
     elif azure:
         if not steps or sum(not is_weak_learning_step(step) for step in steps[:4]) < 2:
             steps = practical_problem_steps_for_topic("azure_mcp")
@@ -2268,6 +2409,19 @@ def build_url_assisted_medium_draft(
             "Understanding first-agent lab flow",
             "Mapping Foundry portal work to VS Code continuation",
             "Defining practical validation criteria",
+        ]
+    elif foundry_iq_mcp_rag:
+        title = "Foundry IQ와 MCP 학습: 지식 기반 AI Agent Workflow 이해하기"
+        subtitle = "Understanding knowledge grounding, RAG, Azure AI Search, MCP, and tool execution"
+        core_problem = "Foundry IQ, RAG, knowledge base, Azure AI Search, MCP가 agent workflow 안에서 각각 어떤 역할을 맡는지 구분하는 것이 핵심 문제였다."
+        key_terms = ["Foundry IQ", "MCP", "Model Context Protocol", "RAG", "knowledge base", "Azure AI Search", "dynamic tool discovery", "tool execution"]
+        final_result = "Foundry IQ를 knowledge grounding 계층으로, MCP를 외부 도구 실행과 dynamic tool discovery를 연결하는 계층으로 분리해 agent workflow를 정리했다."
+        skills = [
+            "Separating knowledge grounding from tool execution",
+            "Understanding Foundry IQ and knowledge base roles",
+            "Connecting RAG with Azure AI Search",
+            "Understanding MCP tool integration",
+            "Defining dynamic tool discovery validation criteria",
         ]
     elif azure:
         title = "Azure DevOps MCP Server 실습: AI assistant와 DevOps 업무 흐름 이해하기"
@@ -2329,6 +2483,8 @@ def build_url_assisted_medium_draft(
     lines.append("## 짧은 도입부")
     if foundry_first_agent:
         lines.append("이번 실습은 Microsoft Foundry에서 첫 agent를 만들고, VS Code로 이어서 작업 흐름을 확인한 뒤, use-agent 단계에서 실행과 테스트 기준을 잡는 과정으로 보았다. 핵심은 Foundry라는 이름만 보고 다른 주제로 넓히는 것이 아니라, quickstart 자료에 실제로 남아 있는 setup, agent 생성, continuation, 사용/검증 단서를 순서대로 이해하는 것이었다.")
+    elif foundry_iq_mcp_rag:
+        lines.append("이번 학습은 Foundry IQ, RAG, Azure AI Search, MCP가 하나의 AI Agent workflow 안에서 어떻게 역할을 나누는지 이해하는 데서 출발했다. 핵심은 지식 기반 응답을 위한 knowledge grounding과 외부 시스템 실행을 위한 tool execution을 섞지 않고 분리하는 것이었다.")
     elif azure:
         lines.append("이번 실습은 Azure DevOps MCP Server가 AI assistant와 DevOps 업무 흐름을 어떻게 연결하는지 이해하는 데서 출발했다. MCP Server를 단순한 서버 설정이 아니라, AI가 work item, pull request, build 같은 DevOps 리소스에 접근하고 업무 맥락을 다룰 수 있게 하는 연결 계층으로 이해하는 것이 핵심이었다.")
     elif agent_orch:
@@ -2355,6 +2511,10 @@ def build_url_assisted_medium_draft(
         lines.append("처음 헷갈린 지점은 Foundry 포털에서 agent를 만드는 단계와 VS Code로 이어서 확인하는 단계의 경계였다. 같은 quickstart 안에 setup, 생성, continuation, 실행 테스트가 이어지기 때문에 각 단계가 무엇을 준비하고 무엇을 검증하는지 나누어 볼 필요가 있었다.")
         lines.append("")
         lines.append("중요한 부분은 제품 소개식 설명이 아니라, 학습자가 실습 중 어디서 무엇을 눌렀고 어떤 파일이나 도구가 어떤 역할을 했으며 마지막에 무엇을 확인해야 하는지 잡는 것이었다.")
+    elif foundry_iq_mcp_rag:
+        lines.append("처음 헷갈린 지점은 Foundry IQ, knowledge base, RAG, Azure AI Search가 모두 지식 연결처럼 보이고, MCP와 dynamic tool discovery는 또 다른 실행 확장처럼 보인다는 점이었다. 둘을 한 덩어리로 보면 agent가 무엇을 근거로 답하고 무엇을 도구로 실행하는지 흐려진다.")
+        lines.append("")
+        lines.append("따라서 먼저 knowledge grounding 계층과 tool execution 계층을 나누고, 각 계층에서 무엇을 검증해야 하는지 정리할 필요가 있었다.")
     elif azure:
         lines.append("처음 헷갈린 지점은 MCP Server의 위치였다. 이름만 보면 별도의 서버를 실행하는 설정 실습처럼 보이지만, 실제 핵심은 AI assistant가 Azure DevOps의 work item, pull request, build 같은 리소스를 업무 맥락 안에서 다룰 수 있게 하는 연결 계층이라는 점이었다.")
         lines.append("")
@@ -2376,6 +2536,8 @@ def build_url_assisted_medium_draft(
     lines.append("")
     if foundry_first_agent:
         lines.append("이 문제는 Foundry라는 제품명만 보고 해결되지 않는다. 첫 agent를 어디서 만들고, VS Code continuation이 어떤 전환점이며, use-agent 단계에서 무엇을 테스트해야 하는지 흐름과 기준을 분리해야 한다.")
+    elif foundry_iq_mcp_rag:
+        lines.append("이 문제는 Foundry IQ나 MCP 같은 용어를 각각 외우는 것으로 해결되지 않는다. knowledge base와 RAG가 응답 근거를 어떻게 만들고, MCP가 외부 도구 실행을 어떻게 확장하는지 흐름으로 연결해야 한다.")
     elif azure:
         lines.append("이 문제는 MCP Server를 단순 설치 대상으로 보면 해결되지 않는다. AI assistant의 자연어 요청이 Azure DevOps 리소스 접근으로 이어지려면, 중간에서 요청과 업무 데이터를 연결하는 계층을 이해해야 한다.")
     elif github:
@@ -2388,6 +2550,8 @@ def build_url_assisted_medium_draft(
     lines.append("## 왜 이것을 문제로 인식했는가")
     if foundry_first_agent:
         lines.append("실습형 자료에서는 개념 이름보다 단계 경계가 더 자주 막힌다. setup, Foundry 포털의 agent 생성, VS Code로 이어지는 작업, use-agent 실행 확인을 구분해야 어떤 부분을 이해했고 어디를 다시 검증해야 하는지 알 수 있다.")
+    elif foundry_iq_mcp_rag:
+        lines.append("Agent workflow에서는 답변의 근거를 어디서 가져오는지와 외부 작업을 어떤 도구로 실행하는지가 서로 다른 문제다. Foundry IQ, RAG, Azure AI Search는 지식 기반 응답의 신뢰도를 좌우하고, MCP와 dynamic tool discovery는 agent가 외부 기능을 선택하고 실행하는 기준을 만든다.")
     elif azure:
         lines.append("AI assistant가 실제 업무 도구와 연결되지 않으면 답변 생성에 머물지만, MCP Server를 통해 Azure DevOps 리소스와 연결되면 업무 항목 조회, PR 확인, build 상태 확인처럼 개발·운영 맥락을 다루는 자동화로 확장될 수 있다.")
     elif github:
@@ -2442,6 +2606,17 @@ def build_url_assisted_medium_draft(
             "use-agent": "생성한 agent를 실제로 실행하고 응답을 확인하는 검증 단계다.",
             "validation": "agent가 실행 가능한 상태인지, 테스트 입력에 기대한 방식으로 응답하는지 확인하는 기준이다.",
         }
+    elif foundry_iq_mcp_rag:
+        concept_descriptions = {
+            "Foundry IQ": "agent가 조직 지식과 문서를 근거로 답변할 수 있게 하는 knowledge grounding 계층이다.",
+            "MCP": "Model Context Protocol을 통해 agent가 외부 도구와 시스템 기능을 사용할 수 있게 하는 연결 방식이다.",
+            "Model Context Protocol": "모델이 외부 context와 tool을 표준화된 방식으로 다루게 하는 프로토콜이다.",
+            "RAG": "질문에 맞는 관련 지식을 검색한 뒤 그 근거를 바탕으로 응답을 생성하는 패턴이다.",
+            "knowledge base": "agent가 답변의 근거로 사용할 문서와 지식 원천이다.",
+            "Azure AI Search": "knowledge base에서 관련 정보를 검색해 RAG 흐름에 연결하는 검색 계층으로 볼 수 있다.",
+            "dynamic tool discovery": "agent가 요청에 맞는 도구를 발견하고 선택하는 실행 확장 방식이다.",
+            "tool execution": "agent가 단순 답변을 넘어 외부 시스템 작업을 수행하는 단계다.",
+        }
     elif azure:
         concept_descriptions = {
             "Azure DevOps MCP Server": "AI assistant와 Azure DevOps 리소스 사이를 연결해 자연어 요청이 work item, pull request, build 같은 업무 데이터 접근으로 이어지도록 돕는 계층이다.",
@@ -2482,6 +2657,8 @@ def build_url_assisted_medium_draft(
     lines.append("## 최종 정리")
     if foundry_first_agent:
         lines.append("이번 실습을 통해 Microsoft Foundry first-agent quickstart를 setup, Foundry에서의 agent 생성, VS Code continuation, use-agent 실행 확인으로 나누어 이해했다. 이 흐름을 분리하니 각 단계가 어떤 역할을 하며 무엇을 기준으로 성공 여부를 확인해야 하는지 더 분명해졌다.")
+    elif foundry_iq_mcp_rag:
+        lines.append("이번 학습을 통해 Foundry IQ, RAG, knowledge base, Azure AI Search를 knowledge grounding 흐름으로 묶고, MCP와 dynamic tool discovery를 tool execution 확장 흐름으로 분리해 이해했다. 이 구분 덕분에 agent workflow에서 답변 근거와 도구 실행을 각각 다른 검증 기준으로 볼 수 있게 되었다.")
     elif azure:
         lines.append("이번 실습을 통해 Azure DevOps MCP Server를 AI assistant와 DevOps 리소스를 연결하는 계층으로 이해했다. MCP Server가 work item, pull request, build 같은 업무 데이터를 AI assistant가 다룰 수 있게 해 주기 때문에, DevOps 자동화는 단순 명령 실행이 아니라 업무 맥락을 이해하고 요청을 처리하는 흐름으로 확장될 수 있다.")
     elif agent_orch:
@@ -2494,6 +2671,8 @@ def build_url_assisted_medium_draft(
     lines.append("## Portfolio Summary")
     if foundry_first_agent:
         lines.append("This learning record summarizes a Microsoft Foundry first-agent quickstart by separating setup, agent creation, VS Code continuation, use-agent execution, and validation criteria.")
+    elif foundry_iq_mcp_rag:
+        lines.append("This learning record explains a Foundry IQ and MCP based AI agent workflow by separating knowledge grounding, RAG, Azure AI Search, dynamic tool discovery, and tool execution.")
     elif azure:
         lines.append("This learning record explains how Azure DevOps MCP Server connects AI assistants with DevOps resources such as work items, pull requests, and builds. The focus is on understanding MCP as a workflow-enabling layer rather than a simple setup task.")
     elif agent_orch:
