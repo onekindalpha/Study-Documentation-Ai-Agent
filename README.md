@@ -1,3 +1,13 @@
+---
+title: Study Capture Copilot
+emoji: 📚
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Study Capture Copilot
 
 Lecture capture-to-technical blog generation service that turns screenshots, course URLs, lab instructions, and rough notes into problem-solving Medium-style drafts.
