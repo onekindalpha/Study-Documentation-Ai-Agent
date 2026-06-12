@@ -890,11 +890,12 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     output_dir = DATA_DIR / "source_packs" / safe_run
     output_dir.mkdir(parents=True, exist_ok=True)
     before = {path.resolve() for path in output_dir.glob("*.md")}
-    profile_dir = DATA_DIR / "browser_profiles" / safe_run
     host = (urlparse(url).netloc or "").lower()
+    is_ai_skills = "aiskillsnavigator.microsoft.com" in host
+    profile_dir = DATA_DIR / "browser_profiles" / ("source-collector" if is_ai_skills else safe_run)
     collector_v2 = BASE_DIR / "tools" / "source_graph_collect_v2.py"
     legacy_collector = BASE_DIR / "tools" / "collect_source_pack.py"
-    if "aiskillsnavigator.microsoft.com" in host:
+    if is_ai_skills:
         collector_script = legacy_collector
     elif ("youtube.com" in host) or ("youtu.be" in host) or ("oopy.io" in host) or ("wikidocs.net" in host):
         collector_script = collector_v2 if collector_v2.exists() else legacy_collector
@@ -904,7 +905,6 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
         os.sys.executable,
         str(collector_script),
         url,
-        "--headless",
         "--out",
         str(output_dir),
         "--no-manual-pause",
@@ -914,13 +914,17 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
         "--crawl-limit",
         "18",
         "--tree-limit",
-        "24",
+        "40" if is_ai_skills else "24",
         "--user-data-dir",
         str(profile_dir),
         "--auto-login-wait",
         "45",
     ]
+    if not is_ai_skills:
+        cmd.insert(3, "--headless")
     started = time.perf_counter()
+    print(f"[collector] run_id={safe_run} seed_url={url}")
+    print(f"[collector] script={collector_script} out={output_dir} profile={profile_dir} headless={not is_ai_skills}")
     try:
         proc = subprocess.run(
             cmd,
@@ -946,9 +950,11 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
         reverse=True,
     )
     if proc.returncode != 0 or not after:
+        print(f"[collector] failed code={proc.returncode} elapsed={round(time.perf_counter() - started, 2)}s")
         return "", {
             "ok": False,
             "error": f"source pack collector failed with code {proc.returncode}",
+            "command": cmd,
             "stdout": proc.stdout[-4000:],
             "stderr": proc.stderr[-4000:],
             "elapsed_seconds": round(time.perf_counter() - started, 2),
@@ -970,6 +976,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             return "", {
                 "ok": False,
                 "error": "collector output does not contain requested playlistId; possible stale browser/profile state",
+                "command": cmd,
                 "markdown_path": str(md_path),
                 "json_path": str(json_path),
                 "collector_title": str(payload_for_seed.get("title") or ""),
@@ -991,10 +998,22 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             quality = {}
             stats = {}
     warnings = quality.get("warnings") or []
-    if "login_or_access_page_detected" in warnings or "low_visible_text" in warnings:
+    text_chars = int(stats.get("visible_text_chars") or quality.get("usable_text_chars") or len(text or ""))
+    page_count = int(stats.get("page_count") or 0)
+    lab_count = int(stats.get("lab_candidate_count") or 0)
+    video_count = int(stats.get("video_candidate_count") or 0)
+    lesson_count = int(stats.get("lesson_candidate_count") or 0)
+    tree_count = int(stats.get("tree_item_count") or 0)
+    has_substantial_evidence = (
+        text_chars >= 8000
+        and page_count >= 2
+        and (lab_count > 0 or video_count > 0 or lesson_count > 0 or tree_count > 0)
+    )
+    if "low_visible_text" in warnings or ("login_or_access_page_detected" in warnings and not has_substantial_evidence):
         return "", {
             "ok": False,
             "error": "source pack quality check failed",
+            "command": cmd,
             "markdown_path": str(md_path),
             "json_path": str(json_path) if json_path.exists() else "",
             "quality": quality,
@@ -1003,8 +1022,10 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             "stderr": proc.stderr[-4000:],
             "elapsed_seconds": round(time.perf_counter() - started, 2),
         }
+    print(f"[collector] ok md={md_path} elapsed={round(time.perf_counter() - started, 2)}s stats={stats}")
     return text, {
         "ok": True,
+        "command": cmd,
         "markdown_path": str(md_path),
         "json_path": str(json_path) if json_path.exists() else "",
         "quality": quality,
@@ -1215,7 +1236,12 @@ def source_pack_quality_sufficient(seed_url: str, source_pack_text: str, collect
     warnings = quality.get("warnings") or []
     warnings = warnings if isinstance(warnings, list) else []
     reasons: list[str] = []
-    if "login_or_access_page_detected" in warnings:
+    has_substantial_evidence = (
+        text_chars >= 8000
+        and page_count >= 2
+        and (lab_count > 0 or video_count > 0 or lesson_count > 0 or tree_count > 0)
+    )
+    if "login_or_access_page_detected" in warnings and not has_substantial_evidence:
         reasons.append("login/access page detected")
     if text_chars < 2200 and page_count <= 1 and lab_count == 0 and video_count == 0 and lesson_count == 0 and tree_count == 0:
         reasons.append(f"too little collected content: text_chars={text_chars}, page_count={page_count}")
@@ -1516,7 +1542,214 @@ def source_pack_snippets(source_pack_text: str, terms: list[str], limit: int = 6
     return unique_preserve_order(snippets, limit=limit)
 
 
-def build_source_graph_grounded_medium_draft(seed_url: str, run_id: str, source_pack_text: str, collector_report: dict[str, Any]) -> str:
+def source_pack_learning_points(source_pack_text: str, headings: list[str], limit: int = 10) -> list[str]:
+    """Pull learner-usable concept/lab statements from the current source pack."""
+    heading_terms = [h.lower() for h in headings[:18] if len(h) >= 4]
+    action_terms = [
+        "when to use", "understand", "compare", "evaluate", "implement", "create",
+        "configure", "deploy", "query", "search", "ranking", "credential", "model",
+        "complex", "difficult", "advanced", "architecture", "workflow", "trade-off",
+        "tradeoffs", "predicate", "function", "stored procedure", "index", "relationship",
+        "permission", "policy", "governance", "identity", "validation", "result",
+        "practical", "real-world", "production", "enterprise", "scale", "admin",
+        "monitor", "visibility", "control", "security", "compliance", "access",
+        "automation", "deployment", "pipeline", "data model", "retrieval",
+        "how to", "best practice", "troubleshoot", "error", "issue", "failure",
+        "slow", "cost", "optimize", "permission denied", "not working", "manage",
+        "lab", "exercise", "verify", "validate", "summary", "key takeaways",
+        "사용", "이해", "비교", "구현", "생성", "설정", "실습", "검증", "확인",
+        "복잡", "어려", "핵심", "쿼리", "수식", "코드", "아키텍처", "워크플로",
+        "권한", "정책", "거버넌스", "원인", "결과", "성능", "인덱스",
+        "실무", "운영", "관리", "모니터링", "보안", "컴플라이언스", "자동화",
+        "배포", "파이프라인", "데이터 모델", "검색", "인증", "접근 제어",
+        "해결", "오류", "에러", "느림", "최적화", "비용", "문제", "방법",
+    ]
+    skip_exact = {
+        "exit", "navigation", "summary", "learn more", "content loaded",
+        "turn module into podcast", "summarize module",
+    }
+    points: list[str] = []
+    candidates: list[tuple[int, int, str]] = []
+    seen: set[str] = set()
+    for order, raw in enumerate((source_pack_text or "").splitlines()):
+        line = re.sub(r"\s+", " ", raw).strip(" -|\t\r\n")
+        if not line or len(line) < 80 or len(line) > 900:
+            continue
+        lower = line.lower()
+        if lower in skip_exact:
+            continue
+        if lower.startswith((
+            "http://", "https://", "## ", "# ", "- h1:", "- h2:", "- h3:",
+            "h1:", "h2:", "h3:", "h4:", "- [", "[item]", "[lab/exercise]",
+            "[lesson_or_course_candidate]", "[lab_or_exercise_candidate]",
+            "[video_or_player_candidate]", "[link]",
+            "page url:", "captured at:", "collection stats", "==== page:",
+            "=====", "content loaded.", "now playing:", "from ",
+            "source pack:", "headings", "video url candidates", "lab / exercise url candidates",
+            "title:", "name:", "source:", "catalogitems title:", "catalogitems source:",
+            "catalogitems name:", "id:", "url:",
+        )):
+            continue
+        if any(bad_fragment in lower for bad_fragment in [
+            "(no text)", "diagram of button", "go.microsoft.com/fwlink",
+            "youtube.com/embed", "youtu.be/", "http://", "https://",
+            "skilling session coach", "ask for clarification", "you can continue with",
+            "looking for content on a particular topic",
+            "you started ", "get certified:", "turn module into podcast",
+        ]):
+            continue
+        if any(bad in lower for bad in ["source graph", "collector", "run_id", "아직 생성된 결과"]):
+            continue
+        line = re.sub(r"^(description|summary|abstract):\s*", "", line, flags=re.IGNORECASE).strip()
+        lower = line.lower()
+        score = 0
+        has_sentence_shape = bool(re.search(r"[.!?。]|다\.|요\.", line))
+        title_like = (
+            not has_sentence_shape
+            or lower.startswith(("exercise -", "episode ", "unlock governance", "design and implement"))
+        )
+        if title_like and len(line) < 180:
+            score -= 4
+        if has_sentence_shape:
+            score += 4
+        if len(line) >= 140:
+            score += 2
+        if any(term in lower for term in action_terms):
+            score += 2
+        if any(term and term in lower for term in heading_terms):
+            score += 2
+        if re.search(r"\b(when|because|requires|helps|uses|can|must|should|first|then|finally)\b", lower):
+            score += 4
+        if re.search(r"\b(problem|challenge|risk|control|identity|access|security|compliance|govern|visibility|validate|verify|result|trade[- ]offs?|performance|precision|recall|embedding|ranking|context|query|predicate|index|function|procedure|architecture|workflow|policy|permission|enterprise|scale|admin|production|real-world|monitor|automation|pipeline|retrieval|how to|best practice|troubleshoot|error|issue|failure|slow|cost|optimize|manage)\b", lower):
+            score += 3
+        if re.search(r"\b(how|why|when|what)\b", lower) and any(x in lower for x in ["manage", "fix", "use", "choose", "configure", "deploy", "secure", "optimize"]):
+            score += 3
+        if re.search(r"(처음|핵심|이유|필요|단계|결과|기준|역할|차이|흐름)", line):
+            score += 3
+        if score < 4:
+            continue
+        key = lower[:260]
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((score, order, line))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    for _score, _order, line in candidates:
+        points.append(line)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def learning_point_paragraph(points: list[str], fallback: str) -> str:
+    if not points:
+        return fallback
+    selected = points[:5]
+    return "\n\n".join(f"- {point}" for point in selected)
+
+
+def build_learning_steps_from_evidence(headings: list[str], points: list[str], labs: list[str], limit: int = 5) -> list[tuple[str, str, str, str]]:
+    concepts = [
+        h for h in unique_preserve_order(headings, limit=limit)
+        if h.lower() not in {"navigation", "introduction", "summary", "key takeaways"}
+    ]
+    steps: list[tuple[str, str, str, str]] = []
+    if labs:
+        lab_title = labs[0]
+        lab_point = points[0] if points else ""
+        steps.append((
+            f"{lab_title} 과제 해결",
+            "Lab/Exercise로 따로 제시된 부분은 단순 읽기만으로 끝나는 개념이 아니라 실제 수행과 검증이 필요한 어려운 과제였다.",
+            (
+                f"`{lab_title}`를 강의의 검증 과제로 보고, 어떤 준비 단계와 실행 단계가 필요한지 분리했다."
+                + (f" 특히 '{lab_point[:220]}'라는 강의 근거를 실습 판단 기준으로 삼았다." if lab_point else "")
+            ),
+            "Lab 제목과 세부 단계가 강의의 핵심 개념을 실제로 확인하는 검증 흐름으로 연결되는지 확인했다.",
+        ))
+    for idx, concept in enumerate(concepts[:limit]):
+        if concept.lower().startswith("ai skills navigator |"):
+            continue
+        if concept.lower() in {"what you'll learn", "copilot said:", "key takeaways"}:
+            continue
+        point = points[idx] if idx < len(points) else ""
+        problem = (
+            f"처음에는 `{concept}`가 앞뒤 단원과 어떤 차이가 있는지 바로 분명하지 않았다. "
+            "정의만 보면 이해한 것 같지만, 실제로는 언제 쓰고 무엇으로 확인해야 하는지까지 연결해야 했다."
+        )
+        action = (
+            f"강의에서 `{concept}`가 설명되는 위치와 함께 나온 세부 문장을 기준으로 역할을 다시 정리했다."
+            + (f" 특히 '{point[:220]}'라는 내용을 기준으로 개념의 쓰임을 확인했다." if point else "")
+        )
+        validation = "이 개념을 한 문장 정의가 아니라 사용 상황, 적용 단계, 확인 결과까지 말할 수 있는지 기준으로 삼았다."
+        steps.append((f"{concept}의 역할 이해", problem, action, validation))
+    if labs and not any("Lab / Exercise" in step[0] or "과제 해결" in step[0] for step in steps):
+        steps.append((
+            "Lab / Exercise로 이해 검증",
+            "개념 설명을 읽는 것과 실제 실습 흐름에서 검증하는 것은 달랐다.",
+            "Lab/Exercise 제목과 단계 링크를 따라가며 어떤 준비, 실행, 확인 단계가 있는지 분리했다.",
+            f"실습 항목이 `{labs[0]}` 같은 검증 흐름으로 연결되는지 확인했다.",
+        ))
+    return steps[:limit] or [
+        (
+            "핵심 개념을 학습 문제로 재정의",
+            "강의 내용을 읽었지만 무엇이 핵심이고 무엇이 보조 설명인지 흐릴 수 있었다.",
+            "제목, 본문 문장, 실습 단서를 묶어 개념의 역할과 확인 기준을 다시 정리했다.",
+            "정리한 내용이 다음 복습 때 설명 가능한 기준으로 남는지 확인했다.",
+        )
+    ]
+
+
+def compact_article_title(title: str) -> str:
+    cleaned = re.sub(r"^AI Skills Navigator\s*\|\s*", "", str(title or "")).strip()
+    return cleaned or str(title or "강의 핵심 주제").strip()
+
+
+def evidence_quote(points: list[str], index: int, fallback: str) -> str:
+    if points:
+        point = points[min(index, len(points) - 1)]
+        point = re.sub(r"\s+", " ", point).strip()
+        if len(point) > 360:
+            point = point[:357].rstrip() + "..."
+        return point
+    return fallback
+
+
+def build_problem_sections_from_source(title: str, headings: list[str], points: list[str], labs: list[str]) -> tuple[str, str, str]:
+    subject = compact_article_title(title)
+    concept_flow = [h for h in headings if h and not h.lower().startswith("ai skills navigator |")][:5]
+    concept_text = ", ".join(concept_flow) or subject
+    first = evidence_quote(points, 0, f"{subject}의 핵심 개념과 실습 단계가 연결되어 있었다.")
+    second = evidence_quote(points, 1, first)
+    third = evidence_quote(points, 2, second)
+    lab_text = ", ".join(labs[:3]) if labs else "강의에서 제시된 확인 단계"
+
+    problem = (
+        f"이 강의에서 문제로 인식한 것은 사람들이 실무에서 해결책을 자주 찾게 되는 `{subject}` 관련 문제를 실제 적용 가능한 해결 기준으로 만드는 것이었다. "
+        f"강의는 `{first}`라는 내용을 통해 이 주제가 추상적인 개념 소개가 아니라 실제 판단과 검증이 필요한 문제임을 보여준다.\n\n"
+        f"따라서 내가 해결해야 한 문제는 `{concept_text}` 흐름을 따라가며 각 개념이 어떤 상황에서 필요한지, 어떤 원인을 다루는지, 어떤 결과로 확인되는지 분리하는 것이었다. "
+        f"특히 `{second}`라는 근거는 이 학습이 단순 요약이 아니라 실제 사용 상황과 결과 확인까지 이어져야 한다는 점을 드러낸다."
+    )
+    definition = (
+        f"문제는 `{subject}`를 사람들이 검색하는 해결 질문에 답할 수 있는 기술 판단 구조로 바꾸는 것으로 정의했다. "
+        f"즉, 강의 속 핵심 내용을 기능 이름이나 단원 제목으로만 남기는 것이 아니라, 문제 상황 → 원인 구조 → 해결 조치 → 확인 결과의 순서로 재구성해야 했다.\n\n"
+        f"이 정의는 `{third}`라는 강의 근거에서 출발한다. 이 내용은 학습자가 단순히 무엇을 배웠는지보다, 해당 개념을 어떤 조건에서 적용하고 어떤 결과로 검증해야 하는지를 설명해야 한다는 문제로 이어진다."
+    )
+    why = (
+        f"이것을 문제로 인식한 이유는 `{first}`에서 보이는 것처럼, 강의의 핵심 개념이 실제 상황에서 사람들이 해결책을 찾는 제약과 바로 연결되기 때문이다. "
+        f"개념만 따로 외우면 `{subject}`가 어떤 문제를 해결하는지 설명하기 어렵고, 실습이나 적용 단계에서 무엇을 성공 기준으로 봐야 하는지도 남지 않는다.\n\n"
+        f"또한 `{second}`라는 내용은 이 주제가 단일 기능 설명이 아니라 여러 판단 기준을 함께 다루는 문제임을 보여준다. "
+        f"그래서 해결 과정에서는 `{concept_text}`를 순서대로 따라가며 원인을 나누고, `{lab_text}`를 통해 결과 확인 기준을 세우는 방식으로 접근했다."
+    )
+    return problem, definition, why
+
+
+def build_source_graph_grounded_medium_draft(
+    seed_url: str,
+    run_id: str,
+    source_pack_text: str,
+    collector_report: dict[str, Any],
+    user_problem: str = "",
+) -> str:
     """Build a human learner-facing Medium draft from collected evidence.
 
     Contract:
@@ -1537,6 +1770,7 @@ def build_source_graph_grounded_medium_draft(seed_url: str, run_id: str, source_
     heading_text = "\n".join(headings).lower()
     pack_l = (source_pack_text or "").lower()
     topic_l = f"{title}\n{heading_text}\n{pack_l}".lower()
+    title_l = title.lower()
 
     def bullets(items: list[str]) -> str:
         clean: list[str] = []
@@ -1556,7 +1790,242 @@ def build_source_graph_grounded_medium_draft(seed_url: str, run_id: str, source_
     def concept_bullets(items: list[tuple[str, str]]) -> str:
         return "\n".join(f"- **{name}**: {desc}" for name, desc in items)
 
-    if "aiskillsnavigator.microsoft.com" in host and ("purview" in topic_l or "secure ai data" in topic_l or "data security posture" in topic_l or "copilot" in topic_l):
+    if "aiskillsnavigator.microsoft.com" in host:
+        stats = source_graph_stats_summary(collector_report)
+        clean_headings = [
+            h for h in unique_preserve_order(headings, limit=18)
+            if h and h.lower() not in {"navigation", "introduction", "summary"}
+        ]
+        title_for_article = title or (clean_headings[0] if clean_headings else "AI Skills Navigator 학습")
+        scope = ", ".join(clean_headings[:6]) or title_for_article
+        flow_items = bullets(clean_headings[:14])
+        lab_items = bullets(labs[:8]) if labs else "- 이번 강의에서는 별도 Lab/Exercise 단계가 중심 흐름으로 드러나지 않았다."
+        video_lines = graph.get("video_url_candidates") or []
+        video_md = bullets([str(v) for v in video_lines[:8]]) if video_lines else "- 이번 강의에서는 별도 영상 링크를 중심 근거로 사용하지 않았다."
+        concept_items = [
+            (h, "이번 강의 흐름 안에서 역할과 확인 기준을 나누어 이해해야 할 개념으로 정리했다.")
+            for h in clean_headings[:8]
+        ] or [(title_for_article, "이번 자료의 중심 학습 주제다.")]
+        concept_md = concept_bullets(concept_items)
+        topic_blob = f"{title_for_article}\n{scope}\n{heading_text}\n{pack_l}"
+        evidence_points = source_pack_learning_points(source_pack_text, clean_headings, limit=12)
+        evidence_md = learning_point_paragraph(
+            evidence_points,
+            "강의 본문에서 확인한 핵심 흐름은 제목을 따라 개념을 나열하는 것이 아니라, 각 개념이 어떤 상황에서 필요하고 어떤 실습 단계로 이어지는지 파악하는 것이었다.",
+        )
+        deeper_points = evidence_points[5:10] or evidence_points[:5]
+        snippet_md = learning_point_paragraph(deeper_points, evidence_md)
+
+        user_problem = re.sub(r"\[생성 직전 사용자가 정의한 어려운 문제\]", "", str(user_problem or "")).strip()
+        user_problem = re.sub(r"없음\.\s*자료의 핵심 흐름을 바탕으로 문제를 정의하고 해결 과정 작성\.?", "", user_problem).strip()
+        learner_intro = (
+            f"이번에 나는 `{title_for_article}` 강의를 학습하면서, 강의가 제시한 핵심 개념을 실제 문제 해결 기준으로 바꾸는 데 집중했다. "
+            f"가장 먼저 붙잡은 근거는 `{evidence_quote(evidence_points, 0, compact_article_title(title_for_article))}`였다. 이 문장은 이번 학습이 단순한 개념 소개가 아니라 실제 상황에서 어떤 문제를 해결해야 하는지 판단하는 과정임을 보여준다."
+        )
+        learner_problem, learner_definition, learner_why = build_problem_sections_from_source(
+            title_for_article,
+            clean_headings,
+            evidence_points,
+            labs,
+        )
+        if user_problem:
+            learner_problem = (
+                f"사용자가 이번 학습에서 중심 문제로 지정한 것은 `{user_problem}`였다. "
+                "따라서 이 글의 문제 인식은 자료 전체를 일반적으로 요약하는 것이 아니라, 사용자가 지정한 어려운 문제를 강의 내용으로 해결하는 데 맞춘다.\n\n"
+                f"강의 근거로는 `{evidence_quote(evidence_points, 0, compact_article_title(title_for_article))}`가 먼저 연결된다. "
+                "이 근거를 기준으로 사용자가 정의한 문제가 어떤 개념, 원인 구조, 실습 검증 기준과 연결되는지 확인했다."
+            )
+            learner_definition = (
+                f"이 학습에서 정의한 문제는 `{user_problem}`를 해결 가능한 기술 문제로 구체화하는 것이었다. "
+                "단순히 어렵다고 느낀 지점을 기록하는 것이 아니라, 강의에서 제공한 개념과 실습 흐름을 사용해 원인과 해결 기준을 분리해야 했다.\n\n"
+                f"이를 위해 `{evidence_quote(evidence_points, 1, evidence_quote(evidence_points, 0, compact_article_title(title_for_article)))}`라는 강의 내용을 근거로 삼았다. "
+                "이 내용은 사용자가 지정한 문제가 어떤 실제 상황에서 발생하고, 어떤 확인 결과로 해결 여부를 판단해야 하는지 설명하는 기준이 된다."
+            )
+            learner_why = (
+                f"`{user_problem}`를 문제로 인식한 이유는 이 지점이 강의의 핵심 개념과 실습 검증 흐름을 연결하는 부분이기 때문이다. "
+                "이 문제를 해결하지 못하면 강의 내용을 들었더라도 실제 적용 조건, 원인 판단, 결과 검증 기준이 남지 않는다.\n\n"
+                f"또한 `{evidence_quote(evidence_points, 2, evidence_quote(evidence_points, 0, compact_article_title(title_for_article)))}`라는 근거는 이 문제가 단순 개념 암기가 아니라 실제 해결 과정으로 다뤄야 할 내용임을 보여준다. "
+                "그래서 해결 과정은 사용자가 지정한 문제를 중심으로 강의의 개념, Lab/Exercise, 검증 기준을 다시 연결하는 방식으로 구성했다."
+            )
+        core_learning_md = f"""이번 강의에서 내가 먼저 정의한 문제는 `{title_for_article}`라는 큰 제목 아래의 개념들을 실제 해결 가능한 학습 과제로 바꾸는 것이었다. 단원명만 보면 전체 목차는 보이지만, 학습자로서는 각 항목이 어떤 문제를 해결하고 무엇으로 결과를 확인해야 하는지가 더 중요했다.
+
+강의 본문에서 특히 눈에 들어온 내용은 다음과 같았다.
+
+{evidence_md}"""
+        complex_detail_md = f"""복잡한 문제는 강의 안의 개념들이 서로 독립된 항목처럼 보이지만 실제로는 하나의 판단 흐름으로 연결된다는 점이었다. 이 문제를 해결하려면 각 개념을 정의로만 이해하지 않고, 어떤 입력 상황에서 필요하고 어떤 결과로 검증되는지까지 연결해야 했다.
+
+내가 복잡한 문제로 정의한 근거는 강의 본문에 남은 세부 설명에서도 확인된다.
+
+{snippet_md}"""
+        practice_flow_md = f"""실습 흐름은 개념을 읽고 끝내는 것이 아니라, 내가 정의한 문제를 실제 단계에서 해결하고 확인하는 방식으로 보았다. 먼저 중심 개념의 역할을 잡고, 그 개념이 쓰이는 위치를 확인한 뒤, Lab이나 Exercise가 있다면 마지막 결과를 통해 해결 여부를 검증하는 흐름이다.
+
+이번 자료에서 실습 또는 확인 흐름으로 잡은 항목은 다음과 같다.
+
+{lab_items}"""
+        outcome_md = f"""이번 강의를 통해 나는 핵심 개념을 단순 용어가 아니라 문제 정의, 원인 판단, 해결 조치, 검증 기준으로 바꾸어 설명할 수 있게 되었다. 특히 `{scope}` 흐름을 따라가며, 비슷해 보이는 항목도 실제로는 서로 다른 문제 상황과 확인 결과에 연결된다는 점을 확인했다.
+
+성과는 강의 내용을 모두 외우는 것이 아니라, 다음에 같은 주제를 다시 만났을 때 어떤 문제를 먼저 정의하고 어떤 원인을 확인하며 어떤 실습 결과로 해결 여부를 검증할지 설명할 수 있게 된 것이다."""
+        portfolio_summary_md = "This learning record explains how I studied the lecture as a learner and converted complex technical content into a problem-solving portfolio narrative. The focus is not on summarizing the material, but on defining the problem, identifying the cause, applying the lesson or lab flow as the solution, and validating the result.\n\nThe outcome is a Medium-ready learning record that shows how the source material became a practical technical problem-solving experience. It documents what problem had to be solved, why it mattered, how the solution was derived from the lecture evidence, and what capability was gained after validation."
+        skills_md = "- Defining complex technical learning problems\n- Identifying cause and structure from lecture evidence\n- Converting lesson flow into solution steps\n- Connecting lab work to validation criteria\n- Writing Medium-ready problem-solving narratives\n- Explaining technical decisions with evidence\n- Avoiding unsupported claims or invented results\n- Documenting portfolio-level learning outcomes"
+        step_sections = build_learning_steps_from_evidence(clean_headings, evidence_points, labs, limit=5)
+
+        if False and "intelligent search" in topic_blob and "sql" in topic_blob:
+            learner_intro = (
+                "이번에 나는 SQL에서 intelligent search를 구현하는 강의를 들으면서, full-text search, vector search, hybrid search가 각각 언제 필요한지 구분하는 데 집중했다. "
+                "처음에는 모두 '검색'이라는 말로 묶여 보여서 비슷하게 느껴졌지만, 강의를 따라가다 보니 키워드 일치, 의미 기반 유사도, 두 결과의 결합은 서로 다른 문제를 해결한다는 점이 핵심이었다."
+            )
+            learner_problem = (
+                "처음 헷갈린 지점은 full-text search와 vector search를 단순히 신기술/기존기술처럼 나누는 것이 아니라, query intent에 따라 선택해야 한다는 점이었다. "
+                "정확한 단어가 중요한 검색인지, 의미가 비슷한 내용을 찾는 검색인지, 둘을 합쳐 ranking을 보정해야 하는 검색인지 구분해야 했다."
+            )
+            learner_definition = (
+                "이 학습에서 문제로 잡은 것은 SQL 안에서 검색 방식을 선택하고 검증하는 기준을 세우는 것이었다. "
+                "full-text index와 predicate는 키워드 기반 검색을 위해 필요했고, vector data type과 embedding은 의미 기반 비교를 위해 필요했다. "
+                "hybrid search와 Reciprocal Rank Fusion은 두 검색 결과를 합쳐 ranking을 조정하는 단계로 이해했다."
+            )
+            learner_why = (
+                "이 내용을 문제로 본 이유는 검색 기능을 구현할 때 '검색이 된다'만으로는 충분하지 않기 때문이다. "
+                "사용자의 질문이 정확한 용어를 포함하는지, 의미적으로 비슷한 문서를 찾아야 하는지, 두 방식의 장점을 함께 써야 하는지에 따라 SQL에서 준비해야 할 인덱스, 벡터 컬럼, embedding 생성, ranking 방식이 달라진다."
+            )
+            core_learning_md = """강의의 핵심은 SQL에서 검색을 하나의 기능으로 뭉뚱그리지 않고, 질문 의도에 따라 검색 방식을 선택하는 것이었다. 사용자가 정확한 단어를 알고 찾는 경우에는 full-text search가 맞고, 표현은 다르지만 의미가 가까운 내용을 찾고 싶을 때는 vector search가 필요하다. 그런데 실제 서비스에서는 둘 중 하나만으로 충분하지 않은 경우가 많기 때문에 hybrid search가 등장한다.
+
+처음에는 full-text search, vector search, hybrid search가 모두 '검색 품질을 높이는 방법'처럼 보였다. 하지만 강의를 따라가며 보니 세 방식은 같은 층위가 아니었다. full-text search는 단어와 구문을 기준으로 관련 문서를 찾는 방식이고, vector search는 embedding을 통해 의미적 가까움을 계산하는 방식이다. hybrid search는 이 둘의 결과를 함께 사용해 keyword match와 semantic similarity를 모두 반영하려는 전략이다."""
+            complex_detail_md = """가장 복잡했던 부분은 검색 방식의 차이가 SQL 구현 요소와 바로 연결된다는 점이었다. full-text search를 하려면 full-text index와 predicate를 이해해야 하고, vector search를 하려면 vector data type, embedding 저장, VECTOR_DISTANCE, VECTOR_SEARCH 같은 함수를 이해해야 한다. 여기서 한 단계 더 나아가 hybrid search는 두 검색 결과를 어떻게 합쳐 ranking할 것인지가 문제가 된다.
+
+특히 Reciprocal Rank Fusion은 처음 보면 단순 ranking 기법처럼 보이지만, 실제로는 full-text 결과와 vector 결과가 서로 다른 점수 체계를 가질 때 두 목록을 무리하게 하나의 점수로 합치지 않고 순위 기반으로 결합하는 방법으로 이해했다. 그래서 hybrid search의 핵심은 '둘 다 실행한다'가 아니라, 서로 다른 검색 신호를 어떤 기준으로 합쳐 최종 결과를 만들 것인가에 있었다.
+
+RAG로 넘어가면 검색은 더 이상 검색 화면만의 문제가 아니었다. SQL에서 vector search로 관련 데이터를 찾고, 그 결과를 JSON context로 정리한 뒤, prompt에 넣어 모델 응답의 근거로 쓰는 흐름이 된다. 이때 SQL의 역할은 단순 저장소가 아니라 retrieval context를 만드는 계층으로 확장된다."""
+            practice_flow_md = """실습 흐름도 개념 차이와 직접 연결되어 있었다. 먼저 Azure SQL Database를 준비하고, Foundry project와 Azure OpenAI model을 배포한 뒤, SQL에서 외부 모델을 호출할 수 있도록 database scoped credential과 external model을 만든다. 그 다음 ProductReview 같은 테이블에 vector column을 추가하고 embedding을 생성한다.
+
+검색 실습에서는 full-text index를 만든 뒤 full-text predicate로 검색하고, 같은 데이터에 대해 vector similarity search를 실행한다. 마지막으로 두 결과를 결합해 hybrid search를 수행하면서, 어떤 query intent에서 어떤 방식이 더 적합한지 비교한다. RAG 실습에서는 vector search로 가져온 데이터를 JSON context로 만들고, 그 context를 prompt에 넣어 Azure OpenAI endpoint를 호출한 뒤, stored procedure 형태로 전체 흐름을 묶는다."""
+            outcome_md = """이번 강의를 통해 나는 SQL에서 intelligent search를 구현한다는 것이 단순히 검색 함수를 하나 추가하는 일이 아니라는 점을 이해했다. full-text search는 정확한 단어와 구문을 다루는 방식이고, vector search는 embedding을 기반으로 의미적 유사도를 계산하는 방식이며, hybrid search는 두 신호를 결합해 더 안정적인 검색 결과를 만드는 방식이다.
+
+성과는 각 개념을 암기한 것이 아니라, 어떤 상황에서 어떤 검색 방식을 선택해야 하는지 설명할 수 있게 된 것이다. 또한 Lab 흐름을 통해 Azure SQL Database, external model, vector column, full-text index, VECTOR_SEARCH, RAG stored procedure가 서로 따로 떨어진 기능이 아니라 하나의 검색/응답 파이프라인으로 연결된다는 점을 정리할 수 있었다."""
+            portfolio_summary_md = "This note captures how I studied intelligent search in SQL from a learner's perspective. I focused on distinguishing full-text search, vector search, and hybrid search by query intent, then connected those concepts to SQL implementation details such as full-text indexes, vector columns, embeddings, VECTOR_SEARCH, and Reciprocal Rank Fusion.\n\nThe main learning outcome was not just knowing the names of the features, but being able to explain when each search approach fits, how the lab workflow validates the concept, and how the same retrieval foundation extends into RAG with SQL."
+            skills_md = "- Distinguishing full-text, vector, and hybrid search by query intent\n- Understanding embeddings and vector columns in SQL\n- Connecting full-text indexes and predicates to keyword search\n- Explaining VECTOR_DISTANCE and VECTOR_SEARCH use cases\n- Understanding hybrid ranking with Reciprocal Rank Fusion\n- Mapping lab steps to validation criteria\n- Connecting SQL retrieval to RAG context construction\n- Writing technical learning notes from a learner's point of view"
+            step_sections = [
+                (
+                    "full-text search의 역할을 먼저 분리",
+                    "처음에는 full-text search가 단순 문자열 검색과 얼마나 다른지 흐릿했다.",
+                    "full-text index, predicate, query full-text index 흐름을 키워드와 언어 기반 검색을 위한 준비 단계로 정리했다.",
+                    "정확한 단어 또는 표현을 기준으로 결과를 찾아야 하는 상황에 full-text search가 맞는지 설명할 수 있는지 확인했다.",
+                ),
+                (
+                    "vector search를 의미 기반 검색으로 이해",
+                    "vector search는 embedding, vector column, similarity 같은 용어가 함께 나와서 구현 단계와 개념 단계가 섞여 보였다.",
+                    "vector data type에 embedding을 저장하고, VECTOR_DISTANCE나 VECTOR_SEARCH 같은 함수로 의미적으로 가까운 항목을 찾는 흐름으로 정리했다.",
+                    "단어가 정확히 일치하지 않아도 의미가 가까운 결과를 찾는 상황에서 vector search가 왜 필요한지 설명할 수 있는지 확인했다.",
+                ),
+                (
+                    "hybrid search와 Reciprocal Rank Fusion의 필요성 정리",
+                    "full-text와 vector 중 하나만 고르면 검색 품질을 놓치는 경우가 생길 수 있었다.",
+                    "hybrid search를 키워드 기반 결과와 의미 기반 결과를 함께 사용하고, Reciprocal Rank Fusion으로 순위를 합치는 방식으로 이해했다.",
+                    "검색 의도에 따라 두 결과를 결합해야 하는 이유와 ranking을 보정해야 하는 이유를 말할 수 있는지 확인했다.",
+                ),
+                (
+                    "Lab에서 SQL 구현 흐름 확인",
+                    "개념을 이해해도 실제 SQL 실습에서는 credential, external model, vector column, embedding 생성, full-text index 생성이 어떤 순서로 이어지는지 헷갈릴 수 있었다.",
+                    "Lab 흐름을 Azure SQL Database 준비, database scoped credential 생성, external model 설정, vector column 추가, embedding 생성, full-text index 생성, hybrid query 실행 순서로 정리했다.",
+                    "마지막에 full-text predicate, vector similarity, hybrid search를 각각 실행해 차이를 확인할 수 있는지 기준을 세웠다.",
+                ),
+            ]
+            concept_items = [
+                ("full-text search", "정확한 단어, 구문, 언어 기반 조건을 중심으로 SQL 데이터에서 관련 결과를 찾는 검색 방식으로 이해했다."),
+                ("vector search", "텍스트를 embedding vector로 바꾼 뒤 의미적으로 가까운 항목을 찾는 검색 방식으로 이해했다."),
+                ("hybrid search", "full-text search와 vector search 결과를 함께 사용해 키워드 일치와 의미 유사도를 모두 반영하는 접근으로 정리했다."),
+                ("Reciprocal Rank Fusion", "여러 검색 결과 목록의 순위를 결합해 hybrid search ranking을 조정하는 방식으로 이해했다."),
+                ("database scoped credential", "SQL에서 외부 embedding/model 호출에 필요한 인증 정보를 데이터베이스 범위로 관리하는 요소로 정리했다."),
+                ("external model", "SQL 실습에서 embedding 생성이나 AI 기능 호출을 연결하는 모델 설정 단계로 이해했다."),
+                ("vector column", "생성된 embedding을 SQL 테이블 안에 저장하고 이후 similarity search에 활용하기 위한 컬럼으로 정리했다."),
+                ("RAG with SQL", "SQL에서 검색한 결과를 JSON context나 prompt로 구성해 생성형 AI 응답의 근거로 쓰는 흐름으로 이해했다."),
+            ]
+            concept_md = concept_bullets(concept_items)
+
+        return sanitize_medium_markdown(f"""# {title_for_article}: 복잡한 기술 개념을 문제 해결 흐름으로 전환한 학습 기록
+
+_A problem-solving Medium portfolio note from a learner's technical study_
+
+## 짧은 도입부
+{learner_intro}
+
+## 핵심 작업 요약
+- 내가 정의한 문제: 강의의 복잡한 기술 개념을 실제 해결 가능한 문제 단위로 전환하는 것
+- 학습한 범위: {scope}
+- 해결 기준: 문제 정의, 원인 판단, 조치, 확인 결과
+- 학습 결과: 강의와 실습 근거를 바탕으로 문제 해결형 포트폴리오 기록으로 구성했다.
+
+## 참고한 자료
+- {seed_url}
+
+## 학습 흐름 정리
+{flow_items}
+
+## 핵심 내용 정리
+{core_learning_md}
+
+## 강의에서 참고한 영상/링크
+{video_md}
+
+## 실습에서 확인한 항목
+{lab_items}
+
+## 문제 인식
+{learner_problem}
+
+## 문제 정의
+{learner_definition}
+
+## 왜 이것을 문제로 인식했는가
+{learner_why}
+
+## 문제 해결 경험
+{chr(10).join(f"### {i}. {title}{chr(10)}문제: {problem}{chr(10)}{chr(10)}원인 판단: 강의 내용에서 이 항목이 독립된 설명으로 끝나는 것이 아니라 앞뒤 개념과 실습 확인 단계에 연결되어 있음을 확인했다.{chr(10)}{chr(10)}조치: {action}{chr(10)}{chr(10)}확인 결과: {validation}{chr(10)}" for i, (title, problem, action, validation) in enumerate(step_sections, start=1))}
+
+## 복잡한 문제 해결 경험
+{complex_detail_md}
+
+## 실습 흐름과 검증 기준
+{practice_flow_md}
+
+## 성과
+{outcome_md}
+
+## 사용한 주요 개념 정리
+{concept_md}
+
+## 사용한 주요 수식/코드 정리
+이번 source pack에서 Medium 글에 그대로 인용할 수 있는 수식 또는 코드 원문은 명확하게 제공되지 않았다. 따라서 임의의 코드나 수식을 만들지 않고, 강의에서 확인된 개념·도구·실습 단계의 역할만 문제 해결 흐름 안에서 해석했다.
+
+코드나 수식이 포함된 Lab 원문이 제공되는 경우에는 다음 기준으로 정리한다.
+
+```text
+1. 어떤 문제가 있었는가
+2. 왜 이 코드/수식이 필요했는가
+3. 코드/수식이 어떤 처리를 수행하는가
+4. 결과를 어떻게 검증했는가
+```
+
+## 최종 정리
+이번 학습 기록의 핵심은 강의 내용을 기능 설명으로 요약하는 것이 아니라, 복잡한 기술 문제를 정의하고 원인을 파악한 뒤 강의와 실습 근거로 해결하는 흐름을 남긴 것이다. 나중에 같은 주제를 다시 볼 때도 단원 제목만 훑는 것이 아니라, 어떤 문제를 해결해야 하고 어떤 결과로 검증해야 하는지부터 확인할 수 있다.
+
+## Portfolio Summary
+{portfolio_summary_md}
+
+## Key skills practiced
+{skills_md}
+
+## 이미지 번호와 캡션 목록
+- 이미지 제공 없음: 이번 글은 URL에서 수집한 강의·영상·Lab 텍스트 근거를 바탕으로 작성했다.
+""")
+
+    is_purview_security_topic = (
+        "purview" in title_l
+        or "secure ai data" in title_l
+        or "data security posture" in title_l
+        or "data security" in title_l
+    )
+
+    if "aiskillsnavigator.microsoft.com" in host and is_purview_security_topic:
         article_title = "Microsoft Purview로 AI 데이터 보안 이해하기: Copilot 시대의 데이터 노출·가시성·정책 관리 문제 정리"
         subtitle = "Understanding AI data security risks, Microsoft 365 Copilot exposure, DSPM for AI, and Purview policy management"
         learning_scope = "AI 데이터 보안 위험, Microsoft 365 Copilot으로 달라지는 보호 요구사항, Purview의 Data Security Posture Management for AI, 민감도 레이블과 정책 관리"
@@ -1711,7 +2180,7 @@ def build_source_graph_grounded_medium_draft(seed_url: str, run_id: str, source_
         ]
         portfolio_skills = ["핵심 개념 분리", "학습 흐름 구조화", "실습 검증 기준 설정"]
 
-    if "aiskillsnavigator.microsoft.com" in host and ("purview" in topic_l or "secure ai data" in topic_l or "data security posture" in topic_l or "copilot" in topic_l):
+    if "aiskillsnavigator.microsoft.com" in host and is_purview_security_topic:
         problem_definition_md = """이 학습에서 문제로 잡은 것은 AI 데이터 보안이 기존 문서 보안과 어떻게 달라지는지 구분하는 것이었다. 특히 Microsoft 365 Copilot처럼 조직 데이터와 연결되는 AI를 사용할 때, 위험은 단순히 ‘AI를 쓴다’는 사실에서 생기는 것이 아니라 다음 지점에서 생긴다.
 
 1. 조직 안에서 어떤 AI 사용이 일어나는지 보이지 않는 가시성 부족
@@ -6810,6 +7279,15 @@ def sanitize_medium_markdown(article: str) -> str:
 def postprocess_article_text(article: str) -> str:
     cleaned = article
     replacements = {
+        "헷갈렸던 부분": "복잡하거나 어려운 문제",
+        "헷갈린 부분": "복잡하거나 어려운 문제",
+        "헷갈렸던 개념": "복잡한 개념",
+        "헷갈린 개념": "복잡한 개념",
+        "처음 헷갈린 지점은": "처음 문제로 정의한 지점은",
+        "헷갈릴 수 있었다": "문제로 인식할 수 있었다",
+        "헷갈릴 수 있습니다": "문제로 인식할 수 있습니다",
+        "헷갈렸다": "문제로 인식했다",
+        "헷갈린다": "문제로 인식된다",
         "문제를 확인한 문제로 정의되었다": "문제로 정의되었다",
         "정리해야 했다.로 정의되었다": "정리해야 하는 문제로 정의되었다",
         "정리해야 했다.로 정리되었다": "정리해야 하는 흐름으로 정리되었다",
@@ -7872,6 +8350,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"draft": draft})
         if path == "/api/direct-blog":
             return self.create_direct_blog()
+        if path == "/api/debug-collect-url":
+            return self.debug_collect_url()
         if path == "/api/sessions":
             data = self.read_json()
             return self.json(create_session(str(data.get("title", ""))))
@@ -8137,7 +8617,7 @@ class Handler(BaseHTTPRequestHandler):
                         "mode": "source_graph_collection_insufficient",
                     })
                 if should_use_source_graph_direct_article(seed_url, collector_report, source_pack_text):
-                    direct_article = build_source_graph_grounded_medium_draft(seed_url, url_run_id, source_pack_text, collector_report)
+                    direct_article = build_source_graph_grounded_medium_draft(seed_url, url_run_id, source_pack_text, collector_report, memo)
                     ok, reason = article_matches_seed_url(seed_url, direct_article)
                     if not ok:
                         return self.json({
@@ -8258,6 +8738,28 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": "seed_article_mismatch",
                 })
         return self.json({"draft": result, "elapsed_seconds": elapsed, "image_count": len(image_files), "mode": "url_only_source_graph" if url_only_mode else "batch_upload"})
+
+    def debug_collect_url(self) -> None:
+        data = self.read_json()
+        seed_url = str(data.get("url") or "").strip()
+        if not seed_url:
+            return self.json({"ok": False, "error": "url is required"})
+        run_id = str(data.get("run_id") or make_generation_run_id())
+        timeout_seconds = int(data.get("timeout_seconds") or 600)
+        source_pack_text, collector_report = run_source_pack_collector(seed_url, timeout_seconds=timeout_seconds, run_id=run_id)
+        collector_report = dict(collector_report or {})
+        collector_report["run_id"] = run_id
+        collector_report["seed_url"] = seed_url
+        collector_report["source_graph"] = collector_source_graph(collector_report)
+        sufficient, reasons = source_pack_quality_sufficient(seed_url, source_pack_text, collector_report) if source_pack_text.strip() else (False, ["empty source pack"])
+        return self.json({
+            "ok": bool(source_pack_text.strip()) and bool(collector_report.get("ok")) and sufficient,
+            "source_pack_chars": len(source_pack_text or ""),
+            "source_pack_preview": (source_pack_text or "")[:3000],
+            "quality_sufficient": sufficient,
+            "quality_reasons": reasons,
+            "collector_report": collector_report,
+        })
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -8484,8 +8986,8 @@ INDEX_HTML = """
 <div id="problemPromptModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="problemPromptTitle">
   <div class="modal">
     <h3 id="problemPromptTitle">생성 전에 한 가지만 확인할게요</h3>
-    <p>어려웠던 점이나 헷갈렸던 부분이 있으면 짧게 적어 주세요. 없다면 자료의 핵심 흐름을 바탕으로 작성하겠습니다.</p>
-    <textarea id="problemPromptInput" placeholder="예: VS Code에서 이어서 실행하는 단계가 헷갈렸음, Lab과 영상 설명이 어디서 연결되는지 모르겠음"></textarea>
+    <p>강의에서 해결해야 할 복잡하거나 어려운 문제를 짧게 적어 주세요. 없다면 자료의 핵심 흐름을 바탕으로 문제를 정의하겠습니다.</p>
+    <textarea id="problemPromptInput" placeholder="예: Lab의 검증 기준이 불명확했음, 개념은 이해했지만 실제 실행 결과로 어떻게 확인하는지가 어려웠음"></textarea>
     <div class="modal-actions">
       <button class="secondary" id="problemPromptCancelBtn" type="button">취소</button>
       <button class="secondary" id="problemPromptSkipBtn" type="button">비워두고 생성</button>
@@ -8512,6 +9014,7 @@ let currentNoteIds = [];
 let currentSession = null;
 let lastDebug = null;
 let lastDraftMarkdown = "";
+let activeBlogRequestId = 0;
 
 function show(text) { result.textContent = text; }
 
@@ -8666,8 +9169,9 @@ async function refreshTimeline() {
 
 function renderDebug(payload) {
   lastDebug = payload || {};
-  const tabs = [
+    const tabs = [
     ["Final Article", lastDebug.draft || result.textContent],
+    ["Collector Report", lastDebug.collector_report || {}],
     ["Capture Timeline", lastDebug["Capture Timeline"] || lastDebug.capture_timeline || []],
     ["Q&A Logs", lastDebug["Q&A Logs"] || lastDebug.qa_logs || []],
     ["Image Evidence", lastDebug.image_evidence || []],
@@ -8798,13 +9302,15 @@ async function makeBlog(formatType) {
   const promptNote = await askProblemPrompt();
   if (promptNote === null) return;
   const btn = document.querySelector("#portfolioBtn");
+  const requestId = ++activeBlogRequestId;
+  const seedText = document.querySelector("#rawText").value.trim();
   const extraInfo = [
     ["실습/프로젝트 이름", document.querySelector("#projectName").value],
     ["내가 해결한 핵심 문제", document.querySelector("#coreProblem").value],
     ["중간에 막힌 부분", document.querySelector("#blockedPart").value],
     ["최종 결과", document.querySelector("#finalResult").value],
     ["강조하고 싶은 기술", document.querySelector("#focusTech").value],
-    ["생성 직전 사용자가 적은 어려움/헷갈린 부분", promptNote || "없음. 자료의 핵심 흐름을 바탕으로 문제해결형 글을 작성"]
+    ["생성 직전 사용자가 정의한 어려운 문제", promptNote || "없음. 자료의 핵심 흐름을 바탕으로 문제를 정의하고 해결 과정 작성"]
   ]
     .filter(([, value]) => String(value || "").trim())
     .map(([label, value]) => `- ${label}: ${String(value).trim()}`)
@@ -8812,17 +9318,20 @@ async function makeBlog(formatType) {
   const topic = document.querySelector("#projectName").value.trim() || "학습 기록 기반 문제 해결 경험";
   btn.disabled = true;
   lastDraftMarkdown = "";
-  show("문제 해결형 Medium 초안을 생성하는 중입니다. URL 본문 추출, 이미지 판독, 긴 글 생성이 함께 진행되어 시간이 걸릴 수 있습니다...");
+  lastDebug = null;
+  debugTabs.innerHTML = "";
+  debugPane.textContent = "이번 요청의 자동수집 결과를 기다리는 중입니다.";
+  show(`자동수집을 시작합니다.\n\n입력:\n${seedText.slice(0, 500)}\n\n강의/글/영상/Lab 자료를 먼저 수집한 뒤 글 생성으로 넘어갑니다.`);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 300000);
+  const timeout = setTimeout(() => controller.abort(), 900000);
   try {
     const form = new FormData();
     selectedFiles.forEach(file => form.append("image", file));
     form.append("raw_text", document.querySelector("#rawText").value);
     const baseMemo = document.querySelector("#memo").value;
     const promptMemo = promptNote
-      ? `\n\n[생성 직전 사용자가 적은 어려움/헷갈린 부분]\n${promptNote}`
-      : `\n\n[생성 직전 사용자가 적은 어려움/헷갈린 부분]\n없음. 자료의 핵심 흐름을 바탕으로 작성.`;
+      ? `\n\n[생성 직전 사용자가 정의한 어려운 문제]\n${promptNote}`
+      : `\n\n[생성 직전 사용자가 정의한 어려운 문제]\n없음. 자료의 핵심 흐름을 바탕으로 문제를 정의하고 해결 과정 작성.`;
     form.append("memo", baseMemo + promptMemo);
     form.append("topic", topic);
     form.append("format_type", formatType);
@@ -8834,14 +9343,16 @@ async function makeBlog(formatType) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    if (requestId !== activeBlogRequestId) return;
     show(`[응답 시간: ${data.elapsed_seconds}s · 이미지 ${data.image_count}장]\\n\\n${data.draft}`);
     renderDebug(data);
   } catch (err) {
+    if (requestId !== activeBlogRequestId) return;
     const message = err && (err.name || err.message) ? `${err.name || "Error"}: ${err.message || ""}` : String(err);
     show(`문제 해결형 Medium 글 생성 요청이 완료되지 않았습니다.\n\n원인: ${message}\n\nURL-only 수집이 보호 페이지/로그인/자막 추출/긴 크롤링에 막혔을 수 있습니다. 서버 터미널 로그와 Debug report를 확인해 주세요.`);
   } finally {
     clearTimeout(timeout);
-    btn.disabled = false;
+    if (requestId === activeBlogRequestId) btn.disabled = false;
   }
 }
 

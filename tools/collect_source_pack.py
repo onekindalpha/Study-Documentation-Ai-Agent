@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,11 @@ TREE_LAB_PATTERNS = re.compile(r"(lab|exercise|instructions|실습|랩)", re.IGN
 
 LAB_ACTION_PATTERNS = re.compile(
     r"(launch the exercise|launch exercise|launch lab|start exercise|start lab|open exercise|open lab|begin exercise|begin lab|instructions|view instructions|exercise|lab|실습 시작|실습|랩)",
+    re.IGNORECASE,
+)
+
+VIDEO_ACTION_PATTERNS = re.compile(
+    r"\b(start session|watch session|watch video|play video|start video|open session|view session)\b",
     re.IGNORECASE,
 )
 
@@ -423,7 +429,7 @@ def extract_candidate_items(page, current_url: str) -> dict[str, list[dict]]:
             "tag": item.get("tag") or "",
             "role": item.get("role") or "",
         }
-        if VIDEO_PATTERNS.search(haystack):
+        if VIDEO_PATTERNS.search(haystack) or VIDEO_ACTION_PATTERNS.search(text):
             video_items.append(normalized)
         if LESSON_PATTERNS.search(haystack):
             lesson_items.append(normalized)
@@ -554,6 +560,7 @@ def click_tree_item_by_text(page, text: str) -> bool:
 def collect_tree_item_snapshots(context, page, limit: int = 24) -> tuple[list[dict], list[dict]]:
     snapshots: list[dict] = []
     collected_items: list[dict] = []
+    seen_action_signatures: set[str] = set()
     open_player_navigation(page)
     expand_collapsed_tree_items(page)
 
@@ -596,6 +603,15 @@ def collect_tree_item_snapshots(context, page, limit: int = 24) -> tuple[list[di
                             context,
                             [page],
                             limit=max(0, limit - len(snapshots)),
+                        )
+                    )
+                if len(snapshots) < limit:
+                    snapshots.extend(
+                        collect_video_action_snapshots(
+                            context,
+                            [page],
+                            limit=max(0, limit - len(snapshots)),
+                            seen_signatures=seen_action_signatures,
                         )
                     )
                 if text.strip().lower() == "summary" and len(snapshots) < limit:
@@ -667,6 +683,77 @@ def collect_lab_action_snapshots(context, source_pages: list, limit: int = 8) ->
                 snapshot = collect_page_snapshot(
                     target_page,
                     label=f"lab_action_{len(snapshots) + 1}",
+                    expanded_sections=expanded_sections,
+                )
+                snapshot["clicked_action_text"] = text
+                snapshot["clicked_action_href"] = href
+                snapshots.append(snapshot)
+                if target_page == page and normalize_url_for_visit(page.url) != normalize_url_for_visit(before_url):
+                    page.go_back(wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(1000)
+            except Exception:
+                continue
+    return snapshots
+
+
+def collect_video_action_snapshots(
+    context,
+    source_pages: list,
+    limit: int = 8,
+    seen_signatures: set[str] | None = None,
+) -> list[dict]:
+    snapshots: list[dict] = []
+    if seen_signatures is None:
+        seen_signatures = set()
+    for page in source_pages:
+        if len(snapshots) >= limit:
+            break
+
+        candidates = []
+        for selector in ["a[href]", "button", "[role=button]"]:
+            try:
+                handles = page.locator(selector).all()
+            except Exception:
+                continue
+            for handle in handles[:80]:
+                try:
+                    text = clean_text(handle.inner_text(timeout=500))
+                    href = handle.get_attribute("href", timeout=500) or ""
+                    aria = handle.get_attribute("aria-label", timeout=500) or ""
+                    title = handle.get_attribute("title", timeout=500) or ""
+                    action_text = clean_text(" ".join([text, aria, title]))
+                    if len(action_text) > 180:
+                        continue
+                    if VIDEO_ACTION_PATTERNS.search(action_text) or (
+                        href and VIDEO_PATTERNS.search(href)
+                    ):
+                        signature = f"{selector}|{action_text}|{href}"
+                        if signature in seen_signatures:
+                            continue
+                        seen_signatures.add(signature)
+                        candidates.append((selector, action_text or text, href, handle))
+                except Exception:
+                    continue
+
+        for _selector, text, href, handle in candidates:
+            if len(snapshots) >= limit:
+                break
+            try:
+                before_pages = set(context.pages)
+                before_url = page.url
+                handle.scroll_into_view_if_needed(timeout=1500)
+                handle.click(timeout=3000)
+                page.wait_for_timeout(2500)
+                new_pages = [candidate for candidate in context.pages if candidate not in before_pages]
+                target_page = new_pages[-1] if new_pages else page
+                if new_pages:
+                    target_page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    target_page.wait_for_timeout(1500)
+                expanded_sections = expand_summary_sections(target_page)
+                auto_scroll(target_page, steps=8, delay_ms=400)
+                snapshot = collect_page_snapshot(
+                    target_page,
+                    label=f"video_action_{len(snapshots) + 1}",
                     expanded_sections=expanded_sections,
                 )
                 snapshot["clicked_action_text"] = text
@@ -1254,10 +1341,18 @@ def main() -> None:
         browser = None
         storage_state_path = Path(args.storage_state) if args.storage_state else None
         if args.user_data_dir:
-            context = p.chromium.launch_persistent_context(
-                str(Path(args.user_data_dir)),
-                headless=args.headless,
-            )
+            try:
+                context = p.chromium.launch_persistent_context(
+                    str(Path(args.user_data_dir)),
+                    headless=args.headless,
+                )
+            except Exception as exc:
+                print(f"Persistent profile unavailable; using a temporary browser profile instead: {exc}")
+                fallback_profile = Path(tempfile.mkdtemp(prefix="source-collector-profile-"))
+                context = p.chromium.launch_persistent_context(
+                    str(fallback_profile),
+                    headless=args.headless,
+                )
         else:
             browser = p.chromium.launch(headless=args.headless)
             context_kwargs = {}

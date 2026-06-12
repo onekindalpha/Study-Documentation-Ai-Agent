@@ -6,3 +6,6 @@ __pycache__/
 .DS_Store
 *.before_*
 *.bak
+DEBUG_INFO_FOR_CHATGPT.txt
+patch_*.py
+*.zip
