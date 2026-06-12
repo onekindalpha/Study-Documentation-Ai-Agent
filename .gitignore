@@ -12,3 +12,4 @@ patch_*.py
 
 data/source_runs/
 data/captures/
+tools/extractors/*.before_*

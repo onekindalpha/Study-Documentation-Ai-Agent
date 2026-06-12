@@ -190,3 +190,12 @@ tools/extractors/
 | Universal collector skeleton | 4 | source_graph, collection_report, source_pack, and trace outputs are generated. |
 | Quality gate | 4 | pass/partial/fail and can_generate_article are working at collector level. |
 | Medium writer integration | 2 | Not connected yet by design. |
+
+
+## 2026-06-13 Oopy TOC-only Smoke Test
+
+| Area | Score / 10 | Notes |
+|---|---:|---|
+| Oopy extractor | 6 | Root page TOC detected and collected correctly: 18 TOC candidates, 18 collected, 0 missing, 100% TOC coverage, 0 extra pages outside TOC. |
+| Oopy quality gate | 5 | `toc_candidates`, `toc_collected`, `toc_missing`, `toc_coverage`, and `extra_collected_outside_toc` are now included in quality output. |
+| Oopy limitation | 4 | Image counting currently reflects limited/root evidence and should later aggregate images across TOC pages if needed. |
