@@ -891,15 +891,8 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     output_dir.mkdir(parents=True, exist_ok=True)
     before = {path.resolve() for path in output_dir.glob("*.md")}
     profile_dir = DATA_DIR / "browser_profiles" / safe_run
-    host = (urlparse(url).netloc or "").lower()
     collector_v2 = BASE_DIR / "tools" / "source_graph_collect_v2.py"
-    legacy_collector = BASE_DIR / "tools" / "collect_source_pack.py"
-    if "aiskillsnavigator.microsoft.com" in host:
-        collector_script = legacy_collector
-    elif ("youtube.com" in host) or ("youtu.be" in host) or ("oopy.io" in host) or ("wikidocs.net" in host):
-        collector_script = collector_v2 if collector_v2.exists() else legacy_collector
-    else:
-        collector_script = collector_v2 if collector_v2.exists() else legacy_collector
+    collector_script = collector_v2 if collector_v2.exists() else (BASE_DIR / "tools" / "collect_source_pack.py")
     cmd = [
         os.sys.executable,
         str(collector_script),
