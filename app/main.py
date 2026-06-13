@@ -1,4 +1,11 @@
 from __future__ import annotations
+# --- Study Capture project-root import fix ---
+import sys as _scc_sys
+from pathlib import Path as _scc_Path
+_scc_ROOT = _scc_Path(__file__).resolve().parents[1]
+if str(_scc_ROOT) not in _scc_sys.path:
+    _scc_sys.path.insert(0, str(_scc_ROOT))
+# --- /Study Capture project-root import fix ---
 
 import base64
 import html as html_lib
@@ -596,7 +603,7 @@ def normalize_seed_url_for_collection(url: str) -> str:
 
     This is deliberately conservative: it fixes known typos/aliases but does not
     rewrite unrelated URLs.  The main goal is to avoid a 404 page becoming a
-    low-quality source pack and then leaking old/fallback content into an article.
+    low-quality 수집 자료 and then leaking old/fallback content into an article.
     """
     raw = str(url or "").strip()
     if not raw:
@@ -649,25 +656,102 @@ def clean_youtube_transcript_text(text: str) -> str:
     return text
 
 
+def _format_transcript_items_with_timestamps(transcript_items: Any) -> str:
+    """Normalize transcript items from multiple youtube-transcript-api versions."""
+    lines: list[str] = []
+    for item in transcript_items or []:
+        if isinstance(item, dict):
+            start = float(item.get("start") or 0.0)
+            raw_text = str(item.get("text") or "")
+        else:
+            start = float(getattr(item, "start", 0.0) or 0.0)
+            raw_text = str(getattr(item, "text", "") or "")
+        mm = int(start // 60)
+        ss = int(start % 60)
+        body = clean_youtube_transcript_text(raw_text)
+        if body:
+            lines.append(f"[{mm:02d}:{ss:02d}] {body}")
+    return "\n".join(lines).strip()
+
+
 def transcript_from_youtube_transcript_api(video_id: str) -> tuple[str, str]:
+    """Fetch YouTube transcript across old and new youtube-transcript-api versions.
+
+    The library changed its public API in newer releases; older code using
+    YouTubeTranscriptApi.get_transcript can fail with AttributeError.  This
+    function tries the legacy static method first, then the instance-based
+    fetch/list API.  This prevents otherwise valid captioned videos from being
+    treated as transcript-inaccessible simply because the local package version
+    changed.
+    """
     if not video_id:
         return "", "youtube-transcript-api skipped: missing video id"
+    languages = ["ko", "ko-KR", "en", "en-US", "en-GB"]
+    errors: list[str] = []
     try:
         from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
-        languages = ["ko", "en", "en-US", "en-GB"]
-        transcript_items = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-        lines: list[str] = []
-        for item in transcript_items:
-            start = float(item.get("start") or 0.0)
-            mm = int(start // 60)
-            ss = int(start % 60)
-            body = clean_youtube_transcript_text(str(item.get("text") or ""))
-            if body:
-                lines.append(f"[{mm:02d}:{ss:02d}] {body}")
-        text = "\n".join(lines).strip()
-        return text, f"youtube-transcript-api success: {len(text)} chars"
     except Exception as exc:
-        return "", f"youtube-transcript-api failed: {type(exc).__name__}: {exc}"
+        return "", f"youtube-transcript-api import failed: {type(exc).__name__}: {exc}"
+
+    # Legacy API: youtube-transcript-api <= 0.x
+    try:
+        getter = getattr(YouTubeTranscriptApi, "get_transcript", None)
+        if callable(getter):
+            transcript_items = getter(video_id, languages=languages)
+            text = _format_transcript_items_with_timestamps(transcript_items)
+            if text:
+                return text, f"youtube-transcript-api legacy success: {len(text)} chars"
+            errors.append("legacy get_transcript returned empty")
+    except Exception as exc:
+        errors.append(f"legacy get_transcript failed: {type(exc).__name__}: {exc}")
+
+    # Newer API: YouTubeTranscriptApi().fetch(video_id, languages=[...])
+    try:
+        api = YouTubeTranscriptApi()
+        fetcher = getattr(api, "fetch", None)
+        if callable(fetcher):
+            try:
+                fetched = fetcher(video_id, languages=languages)
+            except TypeError:
+                fetched = fetcher(video_id)
+            text = _format_transcript_items_with_timestamps(fetched)
+            if text:
+                return text, f"youtube-transcript-api fetch success: {len(text)} chars"
+            errors.append("instance fetch returned empty")
+    except Exception as exc:
+        errors.append(f"instance fetch failed: {type(exc).__name__}: {exc}")
+
+    # Newer/older list API: choose manual/generated transcript by language.
+    try:
+        api = YouTubeTranscriptApi()
+        lister = getattr(api, "list", None) or getattr(api, "list_transcripts", None)
+        transcript_list = lister(video_id) if callable(lister) else None
+        if transcript_list:
+            transcript_obj = None
+            for finder_name in ("find_transcript", "find_generated_transcript", "find_manually_created_transcript"):
+                finder = getattr(transcript_list, finder_name, None)
+                if not callable(finder):
+                    continue
+                try:
+                    transcript_obj = finder(languages)
+                    if transcript_obj:
+                        break
+                except Exception as exc:
+                    errors.append(f"{finder_name} failed: {type(exc).__name__}: {exc}")
+            if transcript_obj is None:
+                for candidate in transcript_list:
+                    transcript_obj = candidate
+                    break
+            if transcript_obj is not None:
+                fetched = transcript_obj.fetch()
+                text = _format_transcript_items_with_timestamps(fetched)
+                if text:
+                    return text, f"youtube-transcript-api list success: {len(text)} chars"
+                errors.append("list transcript fetch returned empty")
+    except Exception as exc:
+        errors.append(f"list api failed: {type(exc).__name__}: {exc}")
+
+    return "", "youtube-transcript-api failed: " + " | ".join(errors[-4:])
 
 
 def parse_ytdlp_caption_file(path: Path) -> str:
@@ -694,40 +778,77 @@ def parse_ytdlp_caption_file(path: Path) -> str:
     return clean_youtube_transcript_text(raw)
 
 
+def _best_caption_files(tmp_dir: Path) -> list[Path]:
+    return sorted(
+        [p for p in tmp_dir.glob("*") if p.suffix.lower() in {".vtt", ".json3", ".json"}],
+        key=lambda p: (
+            0 if re.search(r"\.(ko|ko-KR)\.", p.name, re.I) else
+            1 if re.search(r"\.(en|en-US|en-GB)\.", p.name, re.I) else
+            2 if "live_chat" not in p.name.lower() else 9,
+            p.name,
+        ),
+    )
+
+
+def _run_ytdlp_subtitle_attempt(url: str, tmp: str, extra_args: list[str], timeout: int = 120) -> tuple[str, str]:
+    outtmpl = str(Path(tmp) / "%(id)s.%(ext)s")
+    cmd = [
+        os.sys.executable, "-m", "yt_dlp",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-format", "json3/vtt/best",
+        "--output", outtmpl,
+        *extra_args,
+        url,
+    ]
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    caption_files = _best_caption_files(Path(tmp))
+    for caption_file in caption_files:
+        text = parse_ytdlp_caption_file(caption_file)
+        if len(text) >= 500:
+            return text, f"yt-dlp subtitle success: {caption_file.name}, {len(text)} chars"
+    err = (proc.stderr or proc.stdout or "")[-1200:]
+    return "", f"yt-dlp attempt failed: code={proc.returncode}; files={len(caption_files)}; {err}"
+
+
 def transcript_from_ytdlp_subtitles(url: str, video_id: str = "") -> tuple[str, str]:
-    """Use yt-dlp as a subtitle fallback without downloading the video stream."""
+    """Use yt-dlp as a subtitle fallback without downloading video.
+
+    For recent YouTube Live replays and newly uploaded lectures, captions can be
+    exposed through different player clients or require the browser cookie jar.
+    We try several deterministic subtitle-only strategies before declaring the
+    transcript inaccessible.  We still do not generate an article from title-only
+    metadata when every caption route fails.
+    """
     try:
         import tempfile
-        with tempfile.TemporaryDirectory(prefix="study_capture_ytdlp_") as tmp:
-            outtmpl = str(Path(tmp) / "%(id)s.%(ext)s")
-            cmd = [
-                os.sys.executable, "-m", "yt_dlp",
-                "--skip-download",
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs", "ko.*,ko,en.*,en",
-                "--sub-format", "json3/vtt/best",
-                "--output", outtmpl,
-                url,
-            ]
-            proc = subprocess.run(
-                cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=90,
-                check=False,
-            )
-            caption_files = sorted(
-                [p for p in Path(tmp).glob("*") if p.suffix.lower() in {".vtt", ".json3", ".json"}],
-                key=lambda p: (0 if ".ko" in p.name.lower() else 1 if ".en" in p.name.lower() else 2, p.name),
-            )
-            for caption_file in caption_files:
-                text = parse_ytdlp_caption_file(caption_file)
-                if len(text) >= 500:
-                    return text, f"yt-dlp subtitle success: {caption_file.name}, {len(text)} chars"
-            err = (proc.stderr or proc.stdout or "")[-1200:]
-            return "", f"yt-dlp subtitle failed: code={proc.returncode}; files={len(caption_files)}; {err}"
+        attempts: list[tuple[str, list[str], int]] = [
+            ("targeted langs", ["--sub-langs", "ko.*,ko,en.*,en"], 120),
+            ("all subtitles", ["--all-subs"], 150),
+            ("youtube web/android clients", ["--sub-langs", "ko.*,ko,en.*,en", "--extractor-args", "youtube:player_client=web,android"], 150),
+            ("force ipv4", ["--sub-langs", "ko.*,ko,en.*,en", "--force-ipv4"], 150),
+        ]
+        # Local desktop users often already have YouTube access/cookies in Chrome.
+        # If cookie extraction fails, yt-dlp returns a normal error and we continue.
+        for browser in ("chrome", "chromium", "safari"):
+            attempts.append((f"cookies from {browser}", ["--sub-langs", "ko.*,ko,en.*,en", "--cookies-from-browser", browser], 150))
+
+        errors: list[str] = []
+        for label, extra_args, timeout in attempts:
+            with tempfile.TemporaryDirectory(prefix=f"study_capture_ytdlp_{re.sub(r'[^a-z0-9]+', '_', label.lower())}_") as tmp:
+                text, status = _run_ytdlp_subtitle_attempt(url, tmp, extra_args, timeout=timeout)
+                if text:
+                    return text, f"{status} via {label}"
+                errors.append(f"{label}: {status}")
+        return "", "yt-dlp subtitle failed: " + " | ".join(errors[-3:])
     except Exception as exc:
         return "", f"yt-dlp subtitle failed: {type(exc).__name__}: {exc}"
 
@@ -748,6 +869,73 @@ def ytdlp_video_metadata(url: str) -> tuple[dict[str, Any], str]:
     except Exception as exc:
         return {}, f"yt-dlp metadata failed: {type(exc).__name__}: {exc}"
 
+def parse_caption_payload_text(raw: str, ext: str = "") -> str:
+    ext = (ext or "").lower().lstrip(".")
+    data = str(raw or "")
+    if not data.strip():
+        return ""
+    if ext in {"json", "json3"} or data.lstrip().startswith("{"):
+        try:
+            payload = json.loads(data)
+            chunks: list[str] = []
+            for event in payload.get("events", []) if isinstance(payload, dict) else []:
+                start_ms = int(event.get("tStartMs") or 0)
+                mm = start_ms // 60000
+                ss = (start_ms // 1000) % 60
+                seg_text = "".join(str(seg.get("utf8") or "") for seg in (event.get("segs") or []) if isinstance(seg, dict))
+                seg_text = clean_youtube_transcript_text(seg_text)
+                if seg_text:
+                    chunks.append(f"[{mm:02d}:{ss:02d}] {seg_text}")
+            return "\n".join(chunks).strip()
+        except Exception:
+            return clean_youtube_transcript_text(data)
+    if "<text" in data[:2000]:
+        parts = re.findall(r"<text[^>]*>(.*?)</text>", data, flags=re.DOTALL)
+        return "\n".join(clean_youtube_transcript_text(part) for part in parts if clean_youtube_transcript_text(part)).strip()
+    return clean_youtube_transcript_text(data)
+
+
+def transcript_from_ytdlp_metadata_captions(metadata: dict[str, Any]) -> tuple[str, str]:
+    """Fetch caption URLs exposed in yt-dlp metadata without writing subtitle files."""
+    if not isinstance(metadata, dict) or not metadata:
+        return "", "yt-dlp metadata caption skipped: empty metadata"
+    buckets: list[tuple[str, dict[str, Any]]] = []
+    for bucket_name in ("subtitles", "automatic_captions"):
+        bucket = metadata.get(bucket_name)
+        if isinstance(bucket, dict):
+            buckets.append((bucket_name, bucket))
+    if not buckets:
+        return "", "yt-dlp metadata caption skipped: no caption buckets"
+    preferred_langs = ["ko", "ko-KR", "en", "en-US", "en-GB"]
+    errors: list[str] = []
+    ordered_tracks: list[tuple[str, str, dict[str, Any]]] = []
+    for bucket_name, bucket in buckets:
+        keys = list(bucket.keys())
+        lang_order = []
+        for pref in preferred_langs:
+            lang_order.extend([k for k in keys if str(k).lower() == pref.lower() or str(k).lower().startswith(pref.lower() + "-")])
+        lang_order.extend([k for k in keys if k not in lang_order])
+        for lang in lang_order:
+            tracks = bucket.get(lang) or []
+            if not isinstance(tracks, list):
+                continue
+            # Prefer json3 because it preserves timestamps; then vtt/srv.
+            sorted_tracks = sorted(tracks, key=lambda item: 0 if str(item.get("ext") or "").lower() == "json3" else 1 if str(item.get("ext") or "").lower() == "vtt" else 2)
+            for track in sorted_tracks:
+                if isinstance(track, dict) and track.get("url"):
+                    ordered_tracks.append((bucket_name, str(lang), track))
+    for bucket_name, lang, track in ordered_tracks[:20]:
+        try:
+            caption_url = str(track.get("url") or "")
+            raw, _ctype = fetch_url_text(caption_url, timeout=15, limit=2500000)
+            text = parse_caption_payload_text(raw, str(track.get("ext") or ""))
+            if len(text) >= 500:
+                return text, f"yt-dlp metadata caption success: {bucket_name}/{lang}/{track.get('ext')}, {len(text)} chars"
+            errors.append(f"{bucket_name}/{lang}/{track.get('ext')} empty_or_short={len(text)}")
+        except Exception as exc:
+            errors.append(f"{bucket_name}/{lang}/{track.get('ext')} failed: {type(exc).__name__}: {exc}")
+    return "", "yt-dlp metadata caption failed: " + " | ".join(errors[-4:])
+
 
 def youtube_transcript_chars_from_source_text(text: str) -> int:
     m = re.search(r"\[(?:영상 자막|VIDEO_TRANSCRIPT|Transcript)\]\s*(.*)", text or "", flags=re.I | re.S)
@@ -758,6 +946,161 @@ def youtube_transcript_chars_from_source_text(text: str) -> int:
     body = re.split(r"\n\[(?:END_|SOURCE_|VIDEO_|자막 상태)\]", body, maxsplit=1)[0]
     return len(body.strip())
 
+
+
+
+def youtube_playlist_entries_from_ytdlp(url: str, limit: int = 12) -> tuple[list[dict[str, str]], str]:
+    """Return flat playlist entries without downloading videos."""
+    try:
+        proc = subprocess.run(
+            [os.sys.executable, "-m", "yt_dlp", "--flat-playlist", "--dump-json", url],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+            check=False,
+        )
+        entries: list[dict[str, str]] = []
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            vid = str(item.get("id") or item.get("url") or "").strip()
+            if not vid:
+                continue
+            if not re.match(r"^[A-Za-z0-9_-]{6,}$", vid):
+                vid = youtube_video_id(vid)
+            if not vid:
+                continue
+            entries.append({"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "title": str(item.get("title") or vid).strip()})
+            if len(entries) >= limit:
+                break
+        if entries:
+            return entries, f"yt-dlp playlist success: {len(entries)} entries"
+        return [], f"yt-dlp playlist failed: code={proc.returncode}; {(proc.stderr or '')[-800:]}"
+    except Exception as exc:
+        return [], f"yt-dlp playlist failed: {type(exc).__name__}: {exc}"
+
+
+def extract_youtube_urls_from_html_or_text(text: str, base_url: str = "", limit: int = 24) -> list[str]:
+    source = html_lib.unescape(str(text or ""))
+    candidates: list[str] = []
+    for raw in re.findall(r"https?://(?:www\.)?(?:youtube\.com|youtu\.be)[^\s'\"<>]+", source):
+        raw = raw.rstrip("),.;\\\"")
+        vid = youtube_video_id(raw)
+        if vid:
+            candidates.append(f"https://www.youtube.com/watch?v={vid}")
+    for vid in re.findall(r"(?:youtube\.com/embed/|youtube\.com/live/|youtu\.be/)([A-Za-z0-9_-]{6,})", source):
+        candidates.append(f"https://www.youtube.com/watch?v={vid}")
+    for vid in re.findall(r"(?:watch\?v=|watch\\u003fv=)([A-Za-z0-9_-]{6,})", source):
+        candidates.append(f"https://www.youtube.com/watch?v={vid}")
+    for vid in re.findall(r"(?:videoId|video_id|youtubeId|youtube_id)['\"\s:=]+([A-Za-z0-9_-]{6,})", source):
+        candidates.append(f"https://www.youtube.com/watch?v={vid}")
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in candidates:
+        vid = youtube_video_id(u)
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        out.append(f"https://www.youtube.com/watch?v={vid}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def collect_youtube_playlist_source_text(url: str, max_videos: int = 8, max_chars_per_video: int = 18000) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    entries, status = youtube_playlist_entries_from_ytdlp(url, limit=max_videos)
+    blocks = ["[YouTube 플레이리스트 자동 추출]", url, "", f"[플레이리스트 상태] {status}"]
+    transcript_total = 0
+    videos: list[dict[str, Any]] = []
+    for idx, entry in enumerate(entries, start=1):
+        vurl = entry.get("url", "")
+        vtitle = entry.get("title", "")
+        block = fetch_youtube_source_text(vurl, max_chars=max_chars_per_video)
+        tchars = youtube_transcript_chars_from_source_text(block)
+        transcript_total += tchars
+        videos.append({"title": vtitle, "youtube_url": vurl, "transcript_chars": tchars})
+        blocks.append(f"\n\n## 영상 {idx}: {vtitle}\n{block}")
+    text = "\n".join(blocks).strip()
+    quality = {"source_type": "youtube_playlist", "quality_status": "pass" if transcript_total >= 2500 else "fail", "can_generate_article": transcript_total >= 2500, "transcript_chars": transcript_total, "transcript_segments": len(re.findall(r"^\[\d{2}:\d{2}\]", text, flags=re.M)), "video_candidates": len(videos), "missing": [] if transcript_total >= 2500 else ["playlist transcripts not accessible"]}
+    stats = {"page_count": max(1, len(videos)), "visible_text_chars": len(text), "link_count": len(videos), "video_candidate_count": len(videos), "lesson_candidate_count": len(videos), "lab_candidate_count": 0, "tree_item_count": 0}
+    return text, {"ok": transcript_total >= 2500, "collector": "direct_youtube_playlist_transcripts", "quality": quality, "stats": stats, "video_index": videos, "stdout": status, "stderr": "" if transcript_total >= 2500 else "playlist transcripts not accessible", "elapsed_seconds": round(time.perf_counter() - started, 2)}
+
+
+def collect_video_page_source_text(url: str, max_videos: int = 10) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    try:
+        html, _content_type = fetch_url_text(url, timeout=18, limit=1800000)
+    except Exception as exc:
+        return "", {"ok": False, "error": f"fetch_html failed: {type(exc).__name__}: {exc}", "elapsed_seconds": round(time.perf_counter() - started, 2)}
+    parser = _PlainHTMLTextExtractor()
+    try:
+        parser.feed(html)
+        page_text = parser.text()
+        title = parser.title.strip()
+    except Exception:
+        page_text = clean_youtube_transcript_text(html)
+        title = url
+    video_urls = extract_youtube_urls_from_html_or_text(html, base_url=url, limit=max_videos)
+    blocks = ["[강의 페이지 자동 추출]", url]
+    if title:
+        blocks.append(f"제목: {title}")
+    if page_text:
+        blocks.append("\n[페이지 본문]")
+        blocks.append(page_text[:16000])
+    transcript_total = 0
+    videos: list[dict[str, Any]] = []
+    for idx, vurl in enumerate(video_urls, start=1):
+        vtext = fetch_youtube_source_text(vurl, max_chars=16000)
+        tchars = youtube_transcript_chars_from_source_text(vtext)
+        transcript_total += tchars
+        vtitle_match = re.search(r"^영상 제목:\s*(.+)$", vtext, flags=re.M)
+        vtitle = vtitle_match.group(1).strip() if vtitle_match else vurl
+        videos.append({"title": vtitle, "youtube_url": vurl, "transcript_chars": tchars})
+        blocks.append(f"\n\n## 연결 영상 {idx}: {vtitle}\n{vtext}")
+    text = "\n".join(blocks).strip()
+    usable = len(page_text or "") + transcript_total
+    ok = usable >= 2500 and (video_urls or len(page_text) >= 2500)
+    quality = {"source_type": "lecture_video_page", "quality_status": "pass" if ok else "fail", "can_generate_article": ok, "transcript_chars": transcript_total, "transcript_segments": len(re.findall(r"^\[\d{2}:\d{2}\]", text, flags=re.M)), "video_candidates": len(video_urls), "text_chars": len(text), "missing": [] if ok else ["not enough lecture page/video text"]}
+    stats = {"page_count": 1, "visible_text_chars": len(text), "link_count": len(extract_urls_from_text(html)[:200]), "video_candidate_count": len(video_urls), "lesson_candidate_count": max(1, len(video_urls)), "lab_candidate_count": 0, "tree_item_count": 0}
+    return text, {"ok": ok, "collector": "direct_lecture_video_page", "quality": quality, "stats": stats, "video_index": videos, "stdout": f"videos={len(video_urls)} transcript_chars={transcript_total}", "stderr": "" if ok else "not enough lecture page/video text", "elapsed_seconds": round(time.perf_counter() - started, 2)}
+
+
+def youtube_emphasis_moments(transcript_text: str, limit: int = 6) -> list[str]:
+    patterns = [r"중요", r"핵심", r"어려", r"헷갈", r"잠깐", r"멈추", r"다시", r"반복", r"이해", r"주의", r"important", r"key", r"difficult", r"tricky", r"confus", r"pause", r"watch.*again", r"look.*carefully"]
+    out: list[str] = []
+    for raw in (transcript_text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if len(line) < 12:
+            continue
+        if any(re.search(pat, line, flags=re.I) for pat in patterns):
+            out.append(line[:260])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def youtube_deep_focus(title: str, terms: list[str], transcript_text: str) -> str:
+    profile = youtube_topic_profile(title, transcript_text)
+    if profile == "data_structure_algorithm":
+        return "시간 복잡도와 배열 연산 비용을 입력 크기 기준으로 계산하는 방법"
+    if profile == "git_github":
+        return "commit → branch → merge → remote로 변경 사항을 안전하게 흘려보내는 방법"
+    if profile == "function_calling_tools":
+        return "RAG 답변 흐름에서 function calling으로 외부 도구를 선택·호출·검증하는 방법"
+    if profile == "vector_retrieval":
+        return "임베딩 기반 semantic search와 keyword search를 hybrid retrieval로 결합하는 방법"
+    if profile == "llm_engineering":
+        return "RAG·Agent·Evaluation·Monitoring을 하나의 AI Engineering 흐름으로 연결하는 방법"
+    if profile == "copilot_cowork":
+        return "클라우드 에이전트가 작업을 계속 수행할 때 사람이 검토할 지점을 정하는 방법"
+    return (terms[0] if terms else "핵심 개념") + "를 실제 문제 풀이 순서로 적용하는 방법"
 
 def extract_balanced_json_object(source: str, marker: str) -> dict[str, Any] | None:
     start = source.find(marker)
@@ -835,6 +1178,13 @@ def fetch_youtube_source_text(url: str, max_chars: int = 12000) -> str:
 
     if video_id:
         transcript, status = transcript_from_youtube_transcript_api(video_id)
+        transcript_statuses.append(status)
+
+    # yt-dlp metadata often exposes subtitle/automatic-caption URLs even when
+    # youtube-transcript-api cannot fetch the same Live replay.  Try those direct
+    # caption URLs before falling back to file-based subtitle download.
+    if not transcript and isinstance(metadata, dict) and metadata:
+        transcript, status = transcript_from_ytdlp_metadata_captions(metadata)
         transcript_statuses.append(status)
 
     # Some YouTube Live recordings and auto-captioned videos are unavailable to
@@ -951,7 +1301,7 @@ def enrich_raw_text_with_source_urls(raw_text: str, memo: str) -> str:
 def source_pack_like_text(text: str) -> bool:
     source = text.lower()
     markers = [
-        "source pack:",
+        "수집 자료:",
         "## collection stats",
         "## visible page text",
         "## player navigation items",
@@ -989,7 +1339,7 @@ def url_only_without_collected_source(raw_text: str, enriched_text: str) -> bool
 def source_collection_required_message(raw_text: str, enriched_text: str, memo: str) -> str:
     urls = extract_urls_from_text(raw_text)
     url_lines = "\n".join(f"- {url}" for url in urls) or "- URL 없음"
-    return f"""# Source pack 수집이 먼저 필요합니다
+    return f"""# 수집 자료 수집이 먼저 필요합니다
 
 지금 입력은 URL만 있고, Medium 글에 쓸 본문/강의 흐름/랩 실습 내용이 충분히 수집되지 않았습니다. 이 상태에서 바로 글을 만들면 URL ID나 사이트 이름만으로 억지 글이 생성됩니다.
 
@@ -1017,7 +1367,7 @@ def is_udemy_url(url: str) -> bool:
 def udemy_manual_source_pack_message(raw_text: str, memo: str) -> str:
     urls = extract_urls_from_text(raw_text)
     url_lines = "\n".join(f"- {url}" for url in urls) or "- URL 없음"
-    return f"""# Udemy는 수동 source pack이 필요합니다
+    return f"""# Udemy는 수동 수집 자료이 필요합니다
 
 Udemy는 Cloudflare 보안 확인과 로그인/수강 권한 확인이 자동화 브라우저에서 안정적으로 통과되지 않습니다. 그래서 이 앱은 Udemy URL만으로 억지 Medium 글을 만들지 않습니다.
 
@@ -1028,7 +1378,7 @@ Udemy는 Cloudflare 보안 확인과 로그인/수강 권한 확인이 자동화
 1. 일반 브라우저에서 Udemy 강의에 직접 접속합니다.
 2. 강의 제목, 커리큘럼, 현재 강의 설명, 자막/스크립트, 학습 자료 링크를 복사합니다.
 3. 복사한 내용을 앱 입력칸에 붙여 넣습니다.
-4. 그 수동 source pack을 바탕으로 문제해결형 Medium 글을 생성합니다.
+4. 그 수동 수집 자료을 바탕으로 문제해결형 Medium 글을 생성합니다.
 
 ## 사용자가 적은 어려움/헷갈린 부분
 {clean_prompt_memo(memo) or "없음"}
@@ -1086,6 +1436,28 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     host = (urlparse(url).netloc or "").lower()
     path = (urlparse(url).path or "").lower().rstrip("/")
     is_ai_skills = "aiskillsnavigator.microsoft.com" in host
+    if is_youtube_playlist_only(url):
+        print(f"[collector] direct youtube playlist transcript extraction run_id={safe_run} seed_url={url}")
+        text, direct_report = collect_youtube_playlist_source_text(url, max_videos=8, max_chars_per_video=18000)
+        md_path = output_dir / "source_pack.md"
+        json_path = output_dir / "source_graph.json"
+        md_path.write_text(text, encoding="utf-8")
+        payload = {"title": "YouTube playlist", "input_url": url, "current_url": url, "quality": direct_report.get("quality", {}), "stats": direct_report.get("stats", {}), "snapshots": [{"label": "playlist_seed", "type": "playlist", "title": "YouTube playlist", "url": url, "visible_text": text, "headings": ["YouTube playlist"]}], "video_index": direct_report.get("video_index", []), "video_url_candidates": [v.get("youtube_url") for v in direct_report.get("video_index", []) if isinstance(v, dict)], "lesson_url_candidates": [], "lab_url_candidates": [], "tree_items": []}
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return text, {**direct_report, "markdown_path": str(md_path), "json_path": str(json_path), "run_id": safe_run, "seed_url": url}
+
+    is_agent_academy_videos_direct = host == "microsoft.github.io" and path.endswith("/agent-academy/videos")
+    if is_agent_academy_videos_direct:
+        print(f"[collector] direct lecture video page extraction run_id={safe_run} seed_url={url}")
+        text, direct_report = collect_video_page_source_text(url, max_videos=10)
+        if text.strip():
+            md_path = output_dir / "source_pack.md"
+            json_path = output_dir / "source_graph.json"
+            md_path.write_text(text, encoding="utf-8")
+            payload = {"title": "Agent Academy Videos", "input_url": url, "current_url": url, "quality": direct_report.get("quality", {}), "stats": direct_report.get("stats", {}), "snapshots": [{"label": "lecture_video_page", "type": "page", "title": "Agent Academy Videos", "url": url, "visible_text": text, "headings": ["Agent Academy Videos"]}], "video_index": direct_report.get("video_index", []), "video_url_candidates": [v.get("youtube_url") for v in direct_report.get("video_index", []) if isinstance(v, dict)], "lesson_url_candidates": [], "lab_url_candidates": [], "tree_items": []}
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            return text, {**direct_report, "markdown_path": str(md_path), "json_path": str(json_path), "run_id": safe_run, "seed_url": url}
+
     if is_youtube_host(url) and not is_youtube_playlist_only(url):
         print(f"[collector] direct youtube transcript extraction run_id={safe_run} seed_url={url}")
         started = time.perf_counter()
@@ -1309,7 +1681,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     except subprocess.TimeoutExpired as exc:
         return "", {
             "ok": False,
-            "error": f"source pack collector timeout after {timeout_seconds}s",
+            "error": f"수집 자료 collector timeout after {timeout_seconds}s",
             "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
             "stderr": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
             "elapsed_seconds": round(time.perf_counter() - started, 2),
@@ -1325,7 +1697,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
         print(f"[collector] failed code={proc.returncode} elapsed={round(time.perf_counter() - started, 2)}s")
         return "", {
             "ok": False,
-            "error": f"source pack collector failed with code {proc.returncode}",
+            "error": f"수집 자료 collector failed with code {proc.returncode}",
             "command": cmd,
             "stdout": proc.stdout[-4000:],
             "stderr": proc.stderr[-4000:],
@@ -1386,7 +1758,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     if "low_visible_text" in warnings or ("login_or_access_page_detected" in warnings and not has_substantial_evidence):
         return "", {
             "ok": False,
-            "error": "source pack quality check failed",
+            "error": "수집 자료 quality check failed",
             "command": cmd,
             "markdown_path": str(md_path),
             "json_path": str(json_path) if json_path.exists() else "",
@@ -1428,13 +1800,72 @@ def text_contains_seed_playlist(seed_url: str, text: str) -> bool:
     return playlist_id in (text or "")
 
 
-def append_video_transcript_evidence(seed_url: str, source_pack_text: str, collector_report: dict[str, Any], limit: int = 2) -> str:
-    """Append transcript/description evidence for video candidates.
+def is_single_youtube_video_seed(seed_url: str) -> bool:
+    """True when the user's seed is one concrete YouTube video/live URL, not a playlist/index page."""
+    return is_youtube_host(seed_url) and bool(youtube_video_id(seed_url)) and not is_youtube_playlist_only(seed_url)
 
-    The collector can discover embedded YouTube/watch URLs inside AI Skills Navigator,
-    but Playwright page text alone usually does not contain the actual transcript.
-    This step treats video extraction as evidence enrichment, not as the article voice.
+
+def youtube_ids_in_text(text: str) -> list[str]:
+    """Extract unique YouTube video IDs from URLs and explicit "영상 ID" lines."""
+    ids: list[str] = []
+    for raw in extract_urls_from_text(text or "", limit=500):
+        vid = youtube_video_id(raw)
+        if vid and vid not in ids:
+            ids.append(vid)
+    for vid in re.findall(r"영상\s*ID\s*:\s*([A-Za-z0-9_-]{6,})", text or ""):
+        if vid and vid not in ids:
+            ids.append(vid)
+    for vid in re.findall(r"(?:youtube\.com/(?:embed|live)/|youtu\.be/|vi/)([A-Za-z0-9_-]{6,})", text or ""):
+        if vid and vid not in ids:
+            ids.append(vid)
+    return ids
+
+
+def isolate_single_youtube_source_pack(seed_url: str, source_pack_text: str) -> str:
+    """Keep only the requested video evidence for a single-video YouTube run.
+
+    Why this exists:
+    - YouTube descriptions often contain links to previous/next workshops.
+    - Our enrichment step can fetch those linked videos and append their transcripts.
+    - Then the generated article looks like two URLs were mixed.
+
+    For a single YouTube seed, the article must be grounded only in that video.
+    Playlists and lecture index pages are handled separately and may contain multiple videos.
     """
+    if not is_single_youtube_video_seed(seed_url):
+        return source_pack_text
+    seed_vid = youtube_video_id(seed_url)
+    if not seed_vid:
+        return source_pack_text
+    text = str(source_pack_text or "")
+    # Remove enrichment section that may contain related videos from descriptions.
+    text = re.split(r"\n+##\s+Video Transcript Evidence\b", text, maxsplit=1)[0].rstrip()
+    # If multiple YouTube extraction blocks exist, keep only the requested video block.
+    parts = re.split(r"(?=\[YouTube 영상 자동 추출\])", text)
+    if len(parts) <= 1:
+        return text.strip()
+    kept: list[str] = []
+    for part in parts:
+        if "[YouTube 영상 자동 추출]" not in part:
+            if part.strip():
+                kept.append(part.strip())
+            continue
+        part_ids = youtube_ids_in_text(part)
+        if seed_vid in part_ids or seed_url in part:
+            kept.append(part.strip())
+    return "\n\n".join(kept).strip() or text.strip()
+
+
+def append_video_transcript_evidence(seed_url: str, source_pack_text: str, collector_report: dict[str, Any], limit: int = 2) -> str:
+    """Append transcript evidence for discovered video candidates only when safe.
+
+    Single YouTube video runs must NOT append transcripts from links found in the
+    video description.  Those links often point to previous/next workshops, which
+    was the source of URL mixing between different YouTube lectures.
+    """
+    if is_single_youtube_video_seed(seed_url):
+        return isolate_single_youtube_source_pack(seed_url, source_pack_text)
+
     graph = collector_source_graph(collector_report)
     candidates = []
     for item in graph.get("video_url_candidates", []) or []:
@@ -1620,12 +2051,12 @@ def source_pack_seed_match(seed_url: str, source_pack_text: str, collector_repor
     if playlist_id:
         graph_text = json.dumps(collector_source_graph(collector_report), ensure_ascii=False)
         if playlist_id not in (source_pack_text or "") and playlist_id not in graph_text:
-            return False, f"collector output does not include requested playlistId={playlist_id}; likely stale source pack or browser state"
+            return False, f"collector output does not include requested playlistId={playlist_id}; likely stale 수집 자료 or browser state"
     video_id = youtube_video_id(seed_url)
     if video_id:
         graph_text = json.dumps(collector_source_graph(collector_report), ensure_ascii=False)
         if video_id not in (source_pack_text or "") and video_id not in graph_text:
-            return False, f"collector output does not include requested YouTube video id={video_id}; likely stale source pack or previous YouTube result"
+            return False, f"collector output does not include requested YouTube video id={video_id}; likely stale 수집 자료 or previous YouTube result"
     allowed = allowed_domains_for_seed(seed_url)
     if not allowed:
         return True, "no seed domain"
@@ -1641,6 +2072,18 @@ def source_pack_seed_match(seed_url: str, source_pack_text: str, collector_repor
 
 
 def source_pack_quality_sufficient(seed_url: str, source_pack_text: str, collector_report: dict[str, Any]) -> tuple[bool, list[str]]:
+    # YouTube extraction gate 결과가 있으면 기존 direct transcript 품질검사를 우회한다.
+    # 기존 로직은 source_pack_text 안의 자막 글자 수만 보므로,
+    # video/audio fallback으로 만든 extraction_report를 보고도 "video transcript not accessible"로 막는 문제가 있었다.
+    if isinstance(collector_report, dict) and collector_report.get("collector") == "youtube_extraction_gate":
+        er = collector_report.get("extraction_report") or {}
+        if isinstance(er, dict):
+            if er.get("can_generate_draft") is True:
+                return True, []
+            scores = er.get("scores") or {}
+            if int(scores.get("transcript") or 0) >= 5 and int(scores.get("lecture_flow") or 0) >= 5:
+                return True, []
+            return False, [f"youtube extraction gate failed: scores={scores}, can_generate_draft={er.get('can_generate_draft')}"]
     graph = collector_source_graph(collector_report)
     stats = graph.get("stats") if isinstance(graph.get("stats"), dict) else {}
     quality = graph.get("quality") if isinstance(graph.get("quality"), dict) else {}
@@ -1658,7 +2101,7 @@ def source_pack_quality_sufficient(seed_url: str, source_pack_text: str, collect
         quality_status = str(quality.get("quality_status") or "").lower()
         if quality_status == "fail" or quality.get("can_generate_article") is False:
             missing = quality.get("missing") if isinstance(quality.get("missing"), list) else []
-            detail = "; ".join(str(item) for item in missing[:3]) if missing else "collector marked source pack as not enough for article generation"
+            detail = "; ".join(str(item) for item in missing[:3]) if missing else "collector marked 수집 자료 as not enough for article generation"
             reasons.append(f"universal collector quality gate failed: {detail}")
     has_substantial_evidence = (
         text_chars >= 8000
@@ -1708,7 +2151,7 @@ def collector_execution_failure_report(seed_url: str, run_id: str, collector_rep
 
 ## 다음 조치
 - 플레이리스트 안의 개별 영상 URL을 하나씩 넣어 테스트하세요.
-- 플레이리스트 전체를 글로 만들려면 먼저 영상 목록과 각 영상의 자막/요약 source pack을 따로 수집해야 합니다.
+- 플레이리스트 전체를 글로 만들려면 먼저 영상 목록과 각 영상의 자막/요약 수집 자료을 따로 수집해야 합니다.
 """
     return f"""# URL 자동수집에 실패했습니다
 
@@ -1744,7 +2187,7 @@ def collection_failure_report(seed_url: str, run_id: str, collector_report: dict
 
 ## 다음 조치
 - 플레이리스트 안의 개별 영상 URL을 하나씩 넣어 테스트하세요.
-- 플레이리스트 전체 글이 필요하면, 먼저 영상 목록과 각 영상의 자막을 별도 source pack으로 모은 뒤 통합 글을 생성해야 합니다.
+- 플레이리스트 전체 글이 필요하면, 먼저 영상 목록과 각 영상의 자막을 별도 수집 자료으로 모은 뒤 통합 글을 생성해야 합니다.
 """
     return f"""# 수집된 학습 내용이 부족해서 글 생성을 중단했습니다
 
@@ -1798,7 +2241,7 @@ def final_article_mismatch_report(seed_url: str, run_id: str, collector_report: 
 ```
 
 ## 다음 조치
-- 입력창에 이전 URL이나 이전 source pack이 남아 있으면 삭제하세요.
+- 입력창에 이전 URL이나 이전 수집 자료이 남아 있으면 삭제하세요.
 - 새 URL 하나만 입력하고 다시 생성하세요.
 - 반복되면 해당 URL의 자막/본문 수집이 충분한지 먼저 확인해야 합니다.
 """
@@ -1950,7 +2393,7 @@ def source_pack_snippets(source_pack_text: str, terms: list[str], limit: int = 6
 
 
 def source_pack_learning_points(source_pack_text: str, headings: list[str], limit: int = 10) -> list[str]:
-    """Pull learner-usable concept/lab statements from the current source pack."""
+    """Pull learner-usable concept/lab statements from the current 수집 자료."""
     heading_terms = [h.lower() for h in headings[:18] if len(h) >= 4]
     action_terms = [
         "when to use", "understand", "compare", "evaluate", "implement", "create",
@@ -1992,7 +2435,7 @@ def source_pack_learning_points(source_pack_text: str, headings: list[str], limi
             "[video_or_player_candidate]", "[link]",
             "page url:", "captured at:", "collection stats", "==== page:",
             "=====", "content loaded.", "now playing:", "from ",
-            "source pack:", "headings", "video url candidates", "lab / exercise url candidates",
+            "수집 자료:", "headings", "video url candidates", "lab / exercise url candidates",
             "title:", "name:", "source:", "catalogitems title:", "catalogitems source:",
             "catalogitems name:", "id:", "url:",
         )):
@@ -2083,29 +2526,186 @@ def youtube_transcript_text(payload: dict[str, Any], graph: dict[str, Any]) -> s
     return clean_learning_text(text)
 
 
+def youtube_title_from_source_pack(source_pack_text: str) -> str:
+    """Extract the exact video title from the current source pack.
+
+    This prevents the article builder from falling back to a stale graph title or
+    to a topic template from a previous similar URL.
+    """
+    text = str(source_pack_text or "")
+    for pattern in (r"영상 제목\s*:\s*(.+)", r"title\s*:\s*(.+)", r"^#\s+(.+)$"):
+        m = re.search(pattern, text, flags=re.I | re.M)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1)).strip(" -|#\t\r\n")
+            if title and not any(x in title.lower() for x in ["collection failed", "source graph"]):
+                return title[:180]
+    return ""
+
+
+def youtube_transcript_text_from_source_pack(source_pack_text: str, seed_url: str = "") -> str:
+    """Extract only the current video's transcript from source_pack.md.
+
+    The collector writes direct YouTube evidence as:
+      [YouTube 영상 자동 추출]
+      영상 ID: ...
+      영상 제목: ...
+      [영상 자막]
+      ...
+
+    The article builder previously read transcript only from graph nodes.  For
+    direct YouTube runs the transcript can live only in source_pack.md, causing
+    the writer to fall back to generic/past-looking topic templates.
+    """
+    text = isolate_single_youtube_source_pack(seed_url, str(source_pack_text or "")) if seed_url else str(source_pack_text or "")
+    blocks = []
+    for m in re.finditer(r"\[영상 자막\]\s*(.*?)(?=\n\[[^\]\n]{1,80}\]\s*\n|\n##\s+|\Z)", text, flags=re.S):
+        body = m.group(1).strip()
+        if body and "영상 자막 없음" not in body:
+            blocks.append(body)
+    if not blocks:
+        # Some generated source packs have transcript lines without a closing section.
+        m = re.search(r"\[영상 자막\]\s*(.+)\Z", text, flags=re.S)
+        if m:
+            blocks.append(m.group(1).strip())
+    transcript = "\n".join(blocks)
+    transcript = re.sub(r"\n+\[자막 상태\].*", "", transcript, flags=re.S).strip()
+    return clean_learning_text(clean_youtube_transcript_text(transcript))
+
+
+def youtube_title_terms(title: str, limit: int = 8) -> list[str]:
+    """Title-derived fallback terms, used only when transcript evidence is sparse.
+
+    This avoids the useless '핵심 개념' placeholder while staying grounded in the
+    current URL title instead of reusing a previous article template.
+    """
+    t = str(title or "")
+    low = t.lower()
+    patterns: list[tuple[str, list[str]]] = [
+        ("Hub", ["hub"]), ("Switch", ["switch"]), ("Router", ["router"]),
+        ("Layer 2", ["layer 2", "l2"]), ("Layer 3", ["layer 3", "l3"]),
+        ("MAC 주소", ["mac"]), ("IP 라우팅", ["router", "routing", "layer 3"]),
+        ("GitHub Copilot", ["github copilot", "copilot"]), ("코드 제안", ["code", "completion"]),
+        ("마케팅 이벤트 workback", ["marketing event", "workback"]), ("작업 일정", ["timeline", "schedule", "workback"]),
+        ("RAG 평가", ["rag", "evaluation"]), ("검색 품질", ["retrieval", "search quality"]), ("답변 품질", ["answer quality"]),
+        ("Vector Database", ["vector database", "vector databases"]), ("Embedding", ["embedding"]),
+        ("Semantic Search", ["semantic search"]), ("Hybrid Retrieval", ["hybrid retrieval", "hybrid search"]),
+    ]
+    found = []
+    for label, aliases in patterns:
+        if any(a in low for a in aliases):
+            found.append(label)
+    if not found:
+        # Keep meaningful title tokens, not generic stopwords.
+        cleaned = re.sub(r"[^A-Za-z0-9가-힣+/#& .-]", " ", t)
+        stop = {"explained", "difference", "what", "whats", "the", "and", "with", "into", "under", "hood", "magic", "학습", "강의"}
+        for tok in re.split(r"\s+|[|:,-]", cleaned):
+            tok = tok.strip(" _-/|:,.!?()[]{}")
+            if len(tok) < 3 or tok.lower() in stop:
+                continue
+            if tok not in found:
+                found.append(tok)
+            if len(found) >= limit:
+                break
+    return unique_preserve_order(found, limit=limit)
+
+
 def youtube_topic_profile(title: str, transcript_text: str = "") -> str:
     source = f"{title}\n{transcript_text}".lower()
     title_l = str(title or "").lower()
-    if any(x in title_l for x in ["vector", "embedding", "semantic search", "hybrid retrieval", "retrieval"]):
+
+    # Title-first classification.  A current URL's title is the strongest guard
+    # against previous/similar-topic templates leaking into a new article.
+    if any(x in title_l for x in ["github copilot", "copilot |", "copilot ", " copilot", "brk108"]):
+        if any(x in title_l for x in ["workback", "marketing event"]):
+            return "copilot_workback"
+        if any(x in title_l for x in ["cowork", "co-work", "copilot co", "copilot cowork"]):
+            return "copilot_cowork"
+        return "github_copilot_internals"
+    if any(x in title_l for x in ["hub", "switch", "router"]):
+        if any(x in title_l for x in ["layer 2", "layer 3", "l2", "l3"]):
+            return "network_layers"
+        return "network_devices"
+    if any(x in title_l for x in ["rag and agents evaluation", "evaluation", "answer quality", "retrieval quality", "measuring retrieval"]):
+        return "rag_evaluation"
+    if any(x in title_l for x in ["vector", "embedding", "semantic search", "hybrid retrieval", "hybrid search"]):
         return "vector_retrieval"
-    if any(x in title_l for x in ["git", "github", "깃", "깃허브"]):
-        return "git_github"
-    if any(x in title_l for x in ["자료구조", "알고리즘", "algorithm", "data structure"]):
-        return "data_structure_algorithm"
+    if any(x in title_l for x in ["function calling", "tool use", "tool calling", "from rag to ai agents"]):
+        return "function_calling_tools"
     if any(x in title_l for x in ["llm zoomcamp", "ai engineering", "rag", "llm"]):
         return "llm_engineering"
     if any(x in title_l for x in ["cowork", "co-work", "copilot co", "copilot cowork"]):
         return "copilot_cowork"
-    if any(x in source for x in ["embedding", "vector database", "semantic search", "hybrid search", "hybrid retrieval", "qdrant", "elasticsearch"]):
-        return "vector_retrieval"
-    return "general_lecture"
+    if any(x in title_l for x in ["자료구조", "알고리즘", "algorithm", "data structure"]):
+        return "data_structure_algorithm"
+    # Git/GitHub version-control profile must not fire for GitHub Copilot talks.
+    if any(x in title_l for x in ["git ", " git", "깃", "깃허브"]):
+        if "copilot" not in title_l:
+            return "git_github"
+    if "github" in title_l and "copilot" not in title_l:
+        return "git_github"
 
+    # Transcript-based fallback requires stronger evidence than one stray word.
+    if any(x in source for x in ["function calling", "tool calling", "tool schema", "external api"]):
+        return "function_calling_tools"
+    if sum(1 for x in ["embedding", "vector database", "semantic search", "hybrid search", "hybrid retrieval", "qdrant", "elasticsearch"] if x in source) >= 2:
+        return "vector_retrieval"
+    if sum(1 for x in ["commit", "branch", "merge", "pull request", "git status", "remote repository"] if x in source) >= 3:
+        return "git_github"
+    return "general_lecture"
 
 def youtube_domain_terms(title: str, transcript_text: str, limit: int = 18) -> list[str]:
     source = f"{title}\n{transcript_text}"
     lower = source.lower()
     profile = youtube_topic_profile(title, transcript_text)
     banks: dict[str, list[tuple[str, list[str]]]] = {
+        "network_devices": [
+            ("Hub", ["hub", "허브"]),
+            ("Switch", ["switch", "스위치"]),
+            ("Router", ["router", "라우터"]),
+            ("MAC 주소", ["mac address", "mac"]),
+            ("브로드캐스트", ["broadcast", "브로드캐스트"]),
+            ("Collision Domain", ["collision", "collision domain"]),
+            ("네트워크 세그먼트", ["segment", "network segment"]),
+            ("패킷 전달", ["forward", "packet", "frame"]),
+        ],
+        "network_layers": [
+            ("Layer 2 Switch", ["layer 2", "l2", "layer two"]),
+            ("Layer 3 Switch", ["layer 3", "l3", "layer three"]),
+            ("MAC 주소 기반 switching", ["mac", "switching"]),
+            ("IP 라우팅", ["ip", "routing", "route"]),
+            ("VLAN", ["vlan"]),
+            ("Inter-VLAN Routing", ["inter-vlan", "inter vlan"]),
+            ("Router", ["router"]),
+            ("Broadcast Domain", ["broadcast domain", "broadcast"]),
+        ],
+        "github_copilot_internals": [
+            ("GitHub Copilot", ["github copilot", "copilot"]),
+            ("코드 컨텍스트", ["context", "code context"]),
+            ("코드 제안", ["suggestion", "completion", "code completion"]),
+            ("프롬프트 구성", ["prompt", "prompting"]),
+            ("모델 추론", ["model", "inference"]),
+            ("개발자 워크플로우", ["developer workflow", "workflow"]),
+            ("보안/프라이버시", ["security", "privacy", "telemetry"]),
+        ],
+        "copilot_workback": [
+            ("Copilot", ["copilot"]),
+            ("Marketing Event", ["marketing event", "event"]),
+            ("Workback Plan", ["workback", "work back"]),
+            ("일정 역산", ["timeline", "schedule", "due date", "deadline"]),
+            ("작업 분해", ["task", "tasks", "breakdown"]),
+            ("의존성", ["dependency", "dependencies"]),
+            ("검토/승인", ["review", "approval"]),
+        ],
+        "rag_evaluation": [
+            ("RAG 평가", ["rag", "evaluation", "evaluate"]),
+            ("Retrieval Quality", ["retrieval quality", "retrieval"]),
+            ("LLM Answer Quality", ["answer quality", "llm answer"]),
+            ("Ground Truth", ["ground truth", "golden dataset"]),
+            ("Relevance", ["relevance", "relevant"]),
+            ("Precision/Recall", ["precision", "recall"]),
+            ("Faithfulness", ["faithfulness", "grounded"]),
+            ("LLM-as-a-Judge", ["llm as a judge", "judge"]),
+        ],
         "vector_retrieval": [
             ("벡터 데이터베이스", ["vector database", "vector databases", "벡터 데이터베이스"]),
             ("임베딩", ["embedding", "embeddings", "임베딩"]),
@@ -2117,6 +2717,17 @@ def youtube_domain_terms(title: str, transcript_text: str, limit: int = 18) -> l
             ("쿼리", ["query", "queries", "쿼리"]),
             ("유사도", ["similarity", "cosine", "distance"]),
             ("검색 품질 검증", ["evaluate", "evaluation", "relevance", "precision", "recall"]),
+        ],
+        "function_calling_tools": [
+            ("RAG", ["rag", "retrieval augmented", "retrieval-augmented"]),
+            ("AI Agent", ["ai agent", "agents", "agentic"]),
+            ("Function Calling", ["function calling", "tool calling", "function call"]),
+            ("Tool Use", ["tool use", "tools", "use tools"]),
+            ("Tool Schema", ["schema", "json schema", "parameters", "arguments"]),
+            ("API 호출", ["api", "external api", "call api"]),
+            ("도구 실행 결과", ["tool result", "observation", "response"]),
+            ("에이전트 루프", ["loop", "plan", "execute", "observe"]),
+            ("검증/가드레일", ["validation", "guardrail", "permission", "error handling"]),
         ],
         "llm_engineering": [
             ("AI Engineering", ["ai engineering", "ai engineer"]),
@@ -2175,7 +2786,11 @@ def youtube_domain_terms(title: str, transcript_text: str, limit: int = 18) -> l
     if profile == "general_lecture":
         found = infer_learning_terms(source, limit=limit)
     if not found and bank:
+        # For recognized current-title profiles, fallback to the profile bank;
+        # these labels are grounded in the current video title/profile, not old text.
         found = [label for label, _aliases in bank[:6]]
+    if not found:
+        found = youtube_title_terms(title, limit=limit)
     return unique_preserve_order(found, limit=limit)
 
 
@@ -2313,6 +2928,140 @@ def youtube_keyword_sections(title: str, transcript_text: str, limit: int = 7) -
     return sections
 
 
+
+def _scc_read_json_file(path_value: Any, default: Any) -> Any:
+    try:
+        if not path_value:
+            return default
+        p = Path(str(path_value))
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        if not p.exists():
+            return default
+        return json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return default
+
+
+def _scc_youtube_gate_run_dir(collector_report: dict[str, Any]) -> Path | None:
+    run_dir_raw = collector_report.get("run_dir") or ""
+    if not run_dir_raw:
+        return None
+    p = Path(str(run_dir_raw))
+    if not p.is_absolute():
+        p = BASE_DIR / p
+    return p if p.exists() else None
+
+
+def build_youtube_gate_current_run_summary(
+    seed_url: str,
+    run_id: str,
+    source_pack_text: str,
+    collector_report: dict[str, Any],
+    memo: str = "",
+) -> str:
+    """
+    Current-run-only YouTube writer.
+    This bypasses old source_pack/profile/template logic.
+    It uses only:
+    - current run extraction_report.json
+    - current run transcript.json
+    - current run timeline.json
+    - current run concepts.json
+    """
+    run_dir = _scc_youtube_gate_run_dir(collector_report)
+    report = collector_report.get("extraction_report") if isinstance(collector_report.get("extraction_report"), dict) else {}
+    if not report:
+        report = _scc_read_json_file(collector_report.get("extraction_report_path"), {})
+
+    transcript = _scc_read_json_file(run_dir / "transcript.json" if run_dir else "", [])
+    timeline = _scc_read_json_file(run_dir / "timeline.json" if run_dir else "", [])
+    concepts_payload = _scc_read_json_file(run_dir / "concepts.json" if run_dir else "", {"accepted": [], "rejected_false_positives": []})
+
+    title = str(report.get("title") or collector_report.get("title") or "YouTube 강의").strip()
+    scores = report.get("scores") if isinstance(report.get("scores"), dict) else {}
+    assets = report.get("assets") if isinstance(report.get("assets"), dict) else {}
+
+    transcript_rows = transcript if isinstance(transcript, list) else []
+    timeline_rows = timeline if isinstance(timeline, list) else []
+    accepted = concepts_payload.get("accepted", []) if isinstance(concepts_payload, dict) else []
+
+    transcript_text = " ".join(
+        str(row.get("text") or "").strip()
+        for row in transcript_rows
+        if isinstance(row, dict) and str(row.get("text") or "").strip()
+    )
+    transcript_text = re.sub(r"\s+", " ", transcript_text).strip()
+
+    concept_lines = []
+    for c in accepted[:24]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("text") or "").strip()
+        ev = ", ".join(str(x) for x in c.get("evidence", [])[:3]) if isinstance(c.get("evidence"), list) else ""
+        conf = c.get("confidence")
+        if name:
+            concept_lines.append(f"- **{name}** — evidence: {ev or 'current run'}, confidence: {conf}")
+
+    segment_lines = []
+    for seg in timeline_rows:
+        if not isinstance(seg, dict):
+            continue
+        role = str(seg.get("segment_role") or "")
+        if role in {"intro", "topic_setup"}:
+            continue
+        start = seg.get("start")
+        end = seg.get("end")
+        text = re.sub(r"\s+", " ", str(seg.get("transcript") or "")).strip()
+        if not text:
+            continue
+        ocr = seg.get("ocr_text") if isinstance(seg.get("ocr_text"), list) else []
+        ocr_text = " / ".join(str(x) for x in ocr[:3] if x)
+        segment_lines.append(
+            f"### [{start}~{end}] {role or 'lecture_segment'}\n"
+            f"{text[:900]}\n"
+            + (f"\n- 화면/OCR 근거: {ocr_text}\n" if ocr_text else "")
+        )
+        if len(segment_lines) >= 8:
+            break
+
+    if not segment_lines and transcript_text:
+        chunks = re.split(r"(?<=[.!?。！？])\s+", transcript_text)
+        for idx, chunk in enumerate(chunks[:8], start=1):
+            if len(chunk.strip()) >= 80:
+                segment_lines.append(f"### 흐름 {idx}\n{chunk[:900]}")
+
+    transcript_preview = transcript_text[:3500] if transcript_text else "현재 run에서 transcript 텍스트를 충분히 읽지 못했습니다."
+
+    draft = f"""# {title}
+
+## Current Run Guard
+- 입력 URL: {seed_url}
+- run_id: {run_id}
+- run_dir: {run_dir}
+- 이 글은 현재 run의 extraction 결과만 사용합니다.
+- 이전 URL source_pack, 이전 draft, broad profile 문단은 사용하지 않습니다.
+
+## Extraction Report
+- can_generate_draft: {report.get('can_generate_draft')}
+- scores: {scores}
+- assets: {assets}
+
+## 현재 run에서 채택된 핵심 개념
+{chr(10).join(concept_lines) if concept_lines else "- 현재 run에서 신뢰 가능한 concept을 충분히 분리하지 못했습니다."}
+
+## 강의 흐름
+{chr(10).join(segment_lines) if segment_lines else "- timeline segment가 충분하지 않습니다."}
+
+## 대본 기반 강의 노트
+{transcript_preview}
+
+## 검증 메모
+이 결과가 입력 URL의 실제 제목/대본과 다르면, 문제는 글 생성이 아니라 URL 추출 또는 캐시 매칭 단계입니다.
+"""
+
+    return sanitize_medium_markdown(draft)
+
 def build_youtube_content_summary(seed_url: str, title: str, payload: dict[str, Any], graph: dict[str, Any], collector_report: dict[str, Any]) -> str:
     transcript_text = youtube_transcript_text(payload, graph)
     stats = source_graph_stats_summary(collector_report)
@@ -2329,7 +3078,7 @@ def build_youtube_content_summary(seed_url: str, title: str, payload: dict[str, 
         summary_rows.append(
             f"### {idx}. {step_title}\n"
             f"- 문제: {problem}\n"
-            f"- 원인 판단: {cause}\n"
+            f"- 접근 방법: {cause}\n"
             f"- 정리 방향: {action}\n"
             f"- 확인 기준: {validation}"
         )
@@ -2369,8 +3118,20 @@ def youtube_core_problem_from_profile(title: str, terms: list[str], user_problem
     if problem_note:
         return problem_note
     profile = youtube_topic_profile(title, transcript_text)
+    if profile == "network_devices":
+        return "Hub, Switch, Router가 트래픽을 전달하는 방식과 네트워크 범위를 나누는 기준을 구분하는 것"
+    if profile == "network_layers":
+        return "Layer 2 switching과 Layer 3 routing이 각각 어떤 주소 체계와 전달 범위에서 동작하는지 구분하는 것"
+    if profile == "github_copilot_internals":
+        return "GitHub Copilot이 코드 컨텍스트를 바탕으로 제안을 만드는 흐름과 개발자가 검토해야 할 기준을 이해하는 것"
+    if profile == "copilot_workback":
+        return "Copilot으로 마케팅 이벤트 workback 계획을 만들 때 목표, 일정, 작업, 의존성을 어떤 순서로 구조화하는지 이해하는 것"
+    if profile == "rag_evaluation":
+        return "RAG와 Agent 시스템에서 retrieval 품질과 LLM 답변 품질을 어떤 기준으로 분리해 평가하는지 이해하는 것"
     if profile == "vector_retrieval":
         return "벡터 데이터베이스, 임베딩, 의미 기반 검색, 하이브리드 검색이 각각 어떤 검색 품질 문제를 해결하는지 구분하는 것"
+    if profile == "function_calling_tools":
+        return "RAG가 문서 검색으로 답변 근거를 찾는 단계에서, function calling과 tool use를 통해 외부 도구를 호출하고 결과를 다시 판단하는 AI Agent 흐름으로 확장되는 과정을 이해하는 것"
     if profile == "llm_engineering":
         return "LLM 애플리케이션을 단순 프롬프트 실험이 아니라 RAG, 에이전트, 평가, 모니터링, 배포까지 포함한 AI Engineering 흐름으로 이해하는 것"
     if profile == "copilot_cowork":
@@ -2385,6 +3146,42 @@ def youtube_core_problem_from_profile(title: str, terms: list[str], user_problem
 
 def youtube_problem_steps(title: str, terms: list[str], sections: list[dict[str, Any]], transcript_text: str) -> list[tuple[str, str, str, str]]:
     profile = youtube_topic_profile(title, transcript_text)
+    if profile == "network_devices":
+        return [
+            ("Hub의 전달 방식을 먼저 분리", "처음 헷갈린 부분은 Hub가 네트워크 장비이지만 목적지를 가려서 보내는 장비는 아니라는 점이었다.", "Hub는 들어온 신호를 연결된 포트로 넓게 뿌리기 때문에 불필요한 트래픽과 충돌 가능성이 커질 수 있다.", "Hub를 '모두에게 전달하는 장비'로 먼저 정리하고, 이 한계가 왜 Switch와 Router 설명으로 이어지는지 연결했다.", "검증 기준은 같은 LAN 안에서 Hub가 목적지 판단을 하지 못한다는 점을 설명할 수 있는지다."),
+            ("Switch를 MAC 주소 기반 전달로 이해", "Switch는 Hub처럼 포트를 연결하지만 모든 포트로 뿌리는 방식이 아니라 목적지 장치를 학습해 전달한다는 점이 핵심이었다.", "MAC 주소 테이블을 기준으로 프레임을 필요한 포트로 보내기 때문에 네트워크 낭비와 충돌을 줄일 수 있다.", "Switch를 '같은 네트워크 안에서 MAC 주소를 보고 전달 경로를 좁히는 장비'로 정리했다.", "확인 기준은 Hub와 Switch의 차이를 '속도'가 아니라 전달 대상 결정 방식으로 설명하는 것이다."),
+            ("Router를 네트워크 사이의 경로 선택으로 분리", "Router는 같은 네트워크 안의 장비 연결이 아니라 서로 다른 네트워크 사이의 이동을 담당한다는 점이 중요했다.", "IP 주소와 경로 판단이 필요해지는 순간 Switch 수준의 전달만으로는 충분하지 않다.", "Router를 '네트워크 경계를 넘어 목적지 네트워크로 보내는 장비'로 분리했다.", "검증 기준은 같은 LAN 내부 통신과 다른 네트워크로 나가는 통신을 구분할 수 있는지다."),
+        ]
+    if profile == "network_layers":
+        return [
+            ("Layer 2와 Layer 3의 기준을 주소 체계로 나누기", "Layer 2/Layer 3 Switch가 모두 switch라는 이름을 갖고 있어 역할이 섞여 보일 수 있었다.", "Layer 2는 MAC 주소 기반 switching, Layer 3는 IP 주소 기반 routing 판단까지 포함한다.", "먼저 어느 계층의 주소를 기준으로 전달하는지 확인하고, MAC이면 L2, IP routing이면 L3로 구분했다.", "확인 기준은 프레임 전달 문제인지, 네트워크 간 라우팅 문제인지 먼저 판단하는 것이다."),
+            ("VLAN과 네트워크 경계 문제 연결", "같은 물리 switch 안에서도 VLAN이 나뉘면 서로 다른 네트워크처럼 동작할 수 있다.", "VLAN 사이 통신은 단순 L2 switching만으로 해결되지 않고 routing 기능이 필요할 수 있다.", "VLAN 내부 전달과 VLAN 간 전달을 나누고, Layer 3 Switch가 필요한 위치를 정리했다.", "검증 기준은 같은 VLAN 내부 통신과 Inter-VLAN routing 상황을 구분할 수 있는지다."),
+            ("Router와 Layer 3 Switch의 차이 정리", "Layer 3 Switch가 routing을 할 수 있다고 해서 Router와 완전히 같은 맥락으로 보면 혼동이 생긴다.", "둘 다 IP 기반 전달을 하지만 사용 위치와 목적, 성능/구성 맥락이 다를 수 있다.", "Layer 3 Switch는 내부 네트워크/VLAN 간 고속 routing 관점으로, Router는 네트워크 경계와 외부망 연결 관점으로 정리했다.", "확인 기준은 네트워크 설계에서 어느 지점에 어떤 장비가 필요한지 설명하는 것이다."),
+        ]
+    if profile == "github_copilot_internals":
+        return [
+            ("Copilot을 Git 명령어가 아니라 코드 제안 시스템으로 보기", "GitHub라는 단어 때문에 Git workflow와 혼동할 수 있지만 이 강의의 중심은 Copilot이 코드 맥락을 어떻게 사용해 제안을 만드는가였다.", "Copilot은 저장소 관리 명령이 아니라 코드 작성 중 주변 컨텍스트와 프롬프트를 바탕으로 후보를 생성하는 개발 보조 시스템이다.", "먼저 Git/GitHub version control 설명을 제외하고, Copilot의 입력 컨텍스트, 제안 생성, 개발자 검토 흐름으로 다시 잡았다.", "확인 기준은 Copilot 제안을 그대로 수용하지 않고 어떤 맥락과 기준으로 검토해야 하는지 설명할 수 있는지다."),
+            ("제안 결과를 검토 가능한 변경으로 다루기", "AI가 코드를 제안하면 그럴듯해 보여도 요구사항, 보안, 성능, 스타일을 모두 만족한다고 볼 수 없다.", "자동 완성 결과는 초안이지 검증된 구현이 아니다.", "제안을 받은 뒤 테스트, 타입/런타임 오류, 경계 조건, 보안 영향을 확인하는 순서로 정리했다.", "확인 기준은 Copilot이 만든 코드에서 사람이 반드시 확인해야 할 항목을 말할 수 있는지다."),
+            ("개발자 워크플로우 안에서 Copilot 위치 잡기", "Copilot은 개발자를 대체하는 도구가 아니라 탐색, 초안 작성, 반복 수정 속도를 높이는 보조 도구로 이해해야 했다.", "문제 정의와 최종 판단은 여전히 개발자에게 남는다.", "Copilot을 요구사항 이해 → 후보 코드 생성 → 검토/수정 → 테스트의 중간 단계로 배치했다.", "검증 기준은 Copilot 사용 후에도 내가 코드 의도와 동작을 설명할 수 있는지다."),
+        ]
+    if profile == "copilot_workback":
+        return [
+            ("목표와 마감일을 먼저 구조화", "workback 계획은 단순 일정표가 아니라 목표 날짜에서 거꾸로 필요한 작업을 쪼개는 문제였다.", "최종 이벤트 날짜와 산출물을 먼저 정하지 않으면 Copilot이 만든 작업 목록도 검증하기 어렵다.", "이벤트 목표, 마감일, 핵심 산출물을 먼저 입력 기준으로 세우고 이후 작업을 역산하는 흐름으로 정리했다.", "확인 기준은 생성된 일정이 최종 이벤트 목표와 직접 연결되는지다."),
+            ("작업을 단계와 의존성으로 나누기", "마케팅 이벤트는 홍보물, 참석자 관리, 승인, 리허설처럼 서로 의존하는 작업이 많다.", "작업을 단순 목록으로만 만들면 선후관계가 빠져 실행 계획으로 쓰기 어렵다.", "Copilot 결과를 준비 단계, 제작 단계, 승인 단계, 실행 단계로 나누고 의존성을 확인하는 방식으로 정리했다.", "확인 기준은 어떤 작업이 먼저 끝나야 다음 작업이 가능한지 설명할 수 있는지다."),
+            ("생성 결과를 실행 가능한 workback으로 검토", "AI가 만든 계획은 완성본이 아니라 검토해야 할 초안이다.", "담당자, 기한, 누락 작업, 승인 지점이 빠지면 실제 운영에는 부족하다.", "생성된 workback을 날짜, 담당자, 산출물, 승인 기준으로 다시 확인했다.", "검증 기준은 바로 실행 가능한 일정표로 바꿀 수 있는지다."),
+        ]
+    if profile == "rag_evaluation":
+        return [
+            ("Retrieval 평가와 답변 평가 분리", "RAG 시스템은 검색 결과가 나오는 것과 최종 답변이 좋은 것이 서로 다른 문제라는 점이 어려웠다.", "검색이 틀리면 LLM 답변도 흔들리고, 검색이 맞아도 답변이 근거를 왜곡할 수 있다.", "먼저 retrieval quality와 answer quality를 별도 평가 대상으로 나누었다.", "확인 기준은 실패가 검색 단계 문제인지 생성 단계 문제인지 구분하는 것이다."),
+            ("질문-정답-근거 기준 만들기", "평가를 하려면 무엇이 좋은 답인지 비교할 기준이 필요하다.", "ground truth나 기준 답변 없이 결과만 보면 그럴듯한 답변을 품질로 착각할 수 있다.", "질문, 기대 답변, 관련 문서, 평가 기준을 하나의 테스트 케이스로 정리했다.", "검증 기준은 같은 질문에 대해 관련 문서가 검색되고 답변이 그 근거와 일치하는지다."),
+            ("LLM-as-a-Judge를 보조 평가로 보기", "LLM 평가자는 빠르게 품질을 비교할 수 있지만 절대적인 정답 판정기로 쓰면 위험하다.", "평가 프롬프트, 기준, 샘플 품질에 따라 판단이 흔들릴 수 있다.", "LLM-as-a-Judge는 relevance, faithfulness, completeness 같은 항목을 반복 점검하는 보조 수단으로 정리했다.", "확인 기준은 자동 평가 결과를 사람이 검토할 수 있는 근거와 함께 남기는 것이다."),
+        ]
+    if profile == "function_calling_tools":
+        return [
+            ("RAG와 Agent의 경계 분리", "처음 해결해야 할 문제는 RAG와 AI Agent가 모두 LLM을 사용하지만 맡는 일이 다르다는 점을 구분하는 것이었다.", "RAG는 필요한 문서를 찾아 답변 근거를 보강하지만, 외부 시스템을 직접 조회하거나 실행하는 단계까지 자동으로 해결하지는 않는다.", "먼저 질문이 지식 검색 문제인지, 외부 도구 호출이 필요한 실행 문제인지 나누었다. 문서 근거가 필요하면 RAG, API 조회나 계산·상태 변경이 필요하면 tool use로 분리했다.", "확인 기준은 같은 요청을 보고 '검색으로 충분한가, 도구 호출이 필요한가'를 먼저 판단할 수 있는지로 잡았다."),
+            ("Function Calling을 호출 규약으로 이해", "Function Calling은 모델이 임의로 코드를 실행하는 기능처럼 보일 수 있지만, 실제 핵심은 어떤 도구를 어떤 인자로 호출할지 구조화하는 규약을 이해하는 데 있었다.", "도구 이름, 설명, 입력 스키마, 필수 인자, 반환값의 의미가 정리되지 않으면 모델이 호출할 수 있어도 결과를 신뢰하기 어렵다.", "함수 호출을 '도구 선택 → JSON 인자 구성 → 실행 결과 수신 → 후속 답변 반영' 순서로 나누어 정리했다.", "확인 기준은 모델이 왜 그 도구를 골랐고, 어떤 인자를 만들었으며, 반환 결과를 어떻게 답변에 반영했는지 설명할 수 있는지다."),
+            ("Tool 결과 검증과 에이전트 루프 정리", "도구를 호출한 뒤에는 결과를 그대로 믿을지, 오류를 처리할지, 추가 호출이 필요한지 판단해야 한다.", "에이전트가 도구를 사용할수록 잘못된 인자, 권한 문제, 빈 결과, 예외 응답 같은 실패 지점이 늘어난다.", "도구 실행 이후 결과 검증, 오류 처리, 재시도 여부, 사용자 확인이 필요한 지점을 별도 단계로 분리했다.", "검증 기준은 도구 호출이 성공했는지뿐 아니라 그 결과가 원래 질문을 해결하기에 충분한지까지 확인하는 것이다."),
+        ]
     if profile == "vector_retrieval":
         return [
             ("검색 문제를 키워드 매칭이 아니라 의미 표현 문제로 재정의", "처음 해결해야 할 과제는 사용자의 질문과 문서 표현이 정확히 같은 단어를 쓰지 않아도 관련 내용을 찾아야 한다는 점이었다.", "단순 키워드 검색만 기준으로 삼으면 표현이 조금만 달라져도 관련 문서가 누락될 수 있다.", "임베딩과 벡터 데이터베이스 흐름을 기준으로, 텍스트를 벡터 표현으로 바꾸고 유사도 기반으로 검색하는 구조를 정리했다.", "검증 기준은 쿼리와 문서가 같은 단어를 공유하지 않아도 의미적으로 가까운 결과를 찾을 수 있는지로 잡았다."),
@@ -2405,21 +3202,24 @@ def youtube_problem_steps(title: str, terms: list[str], sections: list[dict[str,
         ]
     if profile == "git_github":
         return [
-            ("변경 이력 관리 문제를 Git의 핵심 역할로 정의", "프로젝트를 수정하다 보면 어느 시점에 무엇이 바뀌었고 문제가 생겼을 때 어디로 되돌아가야 하는지 추적하기 어렵다.", "변경을 파일 저장만으로 관리하면 문제 발생 시 원인을 찾기 어렵다.", "commit을 단순 명령어가 아니라 변경 이력을 의미 있는 단위로 고정하는 장치로 정리했다.", "검증 기준은 변경 전후를 설명하고 필요한 시점으로 되돌아갈 수 있는지다."),
-            ("브랜치로 실험과 안정 버전을 분리", "하나의 작업 흐름에서 여러 기능을 동시에 수정하면 실험 코드와 안정 코드가 섞일 수 있다.", "작업 단위가 섞이면 협업과 검증이 어려워진다.", "branch를 작업 공간 분리 문제의 해결책으로 보고 merge는 검증된 변경을 다시 합치는 단계로 정리했다.", "확인 기준은 기능 작업, 실험, 수정 사항을 서로 독립적으로 설명할 수 있는지다."),
-            ("원격 저장소와 협업 흐름 연결", "개인 로컬 저장소만으로는 팀원과 변경 사항을 공유하거나 리뷰 흐름을 만들기 어렵다.", "협업에서는 코드 공유, 리뷰, 반영 기준이 필요하다.", "GitHub, remote, push, pull, Pull Request를 협업 검증 흐름으로 묶었다.", "검증 기준은 로컬 변경이 원격 저장소와 어떻게 연결되고 리뷰 후 반영되는지 설명할 수 있는지다."),
+            ("수정 전 상태 확인 후 작은 단위로 commit 남기기", "가장 먼저 해결한 문제는 변경 사항이 쌓였을 때 무엇을 왜 바꿨는지 추적하는 것이었다.", "파일 저장만 반복하면 나중에 오류가 생겼을 때 어느 수정에서 문제가 시작됐는지 찾기 어렵다.", "작업 전후로 git status와 diff를 확인하고, 관련 있는 변경만 stage한 뒤 하나의 의미 단위로 commit하는 순서로 정리했다.", "확인 기준은 commit 하나를 보고 변경 목적과 영향 범위를 설명할 수 있는지다."),
+            ("branch를 만들어 실험 작업을 main과 분리", "새 기능이나 수정 작업을 바로 main 흐름에서 진행하면 안정 코드와 실험 코드가 섞일 수 있다.", "작업 단위가 분리되지 않으면 되돌리기, 리뷰, 병합 기준이 모두 흐려진다.", "작업을 시작할 때 branch를 만들고, 그 branch 안에서 수정·테스트·commit을 반복한 뒤 검증된 변경만 merge 대상으로 남기는 흐름으로 정리했다.", "확인 기준은 어떤 작업이 어떤 branch에서 진행됐고 main에는 언제 반영되는지 설명할 수 있는지다."),
+            ("remote에 push하고 Pull Request로 검증 흐름 만들기", "로컬에서 동작한 코드도 팀 기준에서는 바로 반영할 수 있는 변경이 아닐 수 있다.", "협업에서는 다른 사람이 변경 내용을 확인하고 충돌이나 영향 범위를 검토할 수 있는 절차가 필요하다.", "local commit을 remote branch로 push하고, Pull Request를 통해 변경 내용·리뷰·merge 순서로 연결하는 흐름으로 정리했다.", "검증 기준은 내 로컬 변경이 원격 저장소에서 어떤 branch와 PR로 연결되는지 설명할 수 있는지다."),
         ]
     if profile == "data_structure_algorithm":
         return [
-            ("복잡도를 성능 판단 기준으로 이해", "자료구조와 알고리즘 학습에서 어려운 점은 용어를 아는 것보다 입력이 커질 때 비용이 어떻게 변하는지 판단하는 것이다.", "개념을 암기해도 실제 문제에서 어떤 풀이가 효율적인지 판단하지 못하면 활용하기 어렵다.", "시간 복잡도와 공간 복잡도를 각각 연산 횟수와 메모리 사용량을 설명하는 기준으로 정리했다.", "검증 기준은 같은 문제에서 더 적절한 자료구조나 알고리즘을 선택할 수 있는지다."),
-            ("자료구조를 저장 방식과 연산 비용으로 분리", "배열, 스택, 큐 같은 구조는 이름은 익숙해도 언제 써야 하는지 헷갈리기 쉽다.", "자료구조마다 접근, 탐색, 삽입, 삭제 비용이 다르기 때문이다.", "각 자료구조를 접근, 탐색, 삽입, 삭제 비용과 연결해 정리했다.", "검증 기준은 문제 조건을 보고 어떤 자료구조가 맞는지 설명할 수 있는지다."),
-            ("알고리즘 설명을 실무적 선택 기준으로 변환", "정렬이나 탐색은 정의만 외우면 실제 문제에서 선택 기준으로 연결되지 않는다.", "알고리즘 선택은 입력 조건과 제한 조건을 함께 봐야 하기 때문이다.", "입력 조건, 필요한 결과, 비용 제한을 기준으로 알고리즘을 선택하는 흐름으로 재구성했다.", "검증 기준은 코드 구현 전 선택 이유를 먼저 설명할 수 있는지다."),
+            ("입력 크기부터 확인해 시간 복잡도 계산", "가장 먼저 해결한 문제는 풀이가 동작하는지가 아니라 입력이 커졌을 때 통과 가능한지 판단하는 것이었다.", "반복문이 한 번 도는지, 중첩되는지, 모든 조합을 만드는지에 따라 연산 횟수가 급격히 달라진다.", "문제를 보면 먼저 입력 크기 n을 잡고, 주요 연산이 몇 번 반복되는지 세어 O(1), O(n), O(n²), O(log n)처럼 증가율을 분류하는 순서로 정리했다.", "확인 기준은 코드를 작성하기 전에 이 풀이가 대략 몇 번의 연산을 요구하는지 말할 수 있는지다."),
+            ("배열 연산을 접근·탐색·삽입·삭제로 나누어 판단", "배열은 단순히 값을 담는 구조처럼 보이지만, 어떤 연산을 자주 하느냐에 따라 적합성이 달라진다.", "인덱스로 바로 접근하는 것과 값을 처음부터 찾는 것, 중간에 값을 넣고 뒤 요소를 밀어야 하는 것은 비용이 다르다.", "배열을 사용할 때는 '인덱스 접근이 많은가, 전체 탐색이 많은가, 중간 삽입/삭제가 많은가' 순서로 확인하도록 정리했다.", "확인 기준은 같은 데이터라도 연산 패턴에 따라 배열을 그대로 쓸지 다른 자료구조를 고민해야 하는지 설명하는 것이다."),
+            ("빅오 표기법으로 풀이 후보를 걸러내기", "여러 풀이가 떠오를 때 어떤 풀이를 먼저 구현해야 하는지 결정하기 어려웠다.", "정답을 만드는 방법이 여러 개여도 입력 제한에 맞지 않는 풀이는 실제 문제에서 실패할 수 있다.", "각 풀이 후보를 Big-O로 먼저 비교하고, 제한 시간과 입력 크기에 맞지 않는 방법을 제외한 뒤 구현 대상으로 남기는 방식으로 정리했다.", "검증 기준은 '왜 이 풀이를 선택했는가'를 단순 취향이 아니라 복잡도 기준으로 설명할 수 있는지다."),
         ]
     fallback_terms = terms[:3] or [section.get("title", "핵심 개념") for section in sections[:3]] or ["핵심 개념"]
+    first = fallback_terms[0]
+    second = fallback_terms[1] if len(fallback_terms) > 1 else "관련 개념"
+    third = fallback_terms[2] if len(fallback_terms) > 2 else "검증 기준"
     return [
-        (f"{fallback_terms[0]}를 중심 문제로 정의", "강의 내용을 그대로 따라가면 정보는 많지만 어떤 개념이 실제 문제 해결의 중심인지 흐려질 수 있다.", "개념 간 역할이 분리되지 않으면 요약은 가능해도 설명은 어려워진다.", f"{fallback_terms[0]}를 기준으로 강의 내용을 다시 묶고 해당 개념이 왜 필요한지와 어떤 상황에서 쓰이는지 정리했다.", "검증 기준은 이 개념을 한 문장 정의가 아니라 적용 조건까지 설명할 수 있는지다."),
-        ("관련 개념 간 역할 구분", "비슷한 용어가 연속해서 나오면 각각의 역할과 경계가 모호해진다.", "핵심 용어를 구분하지 않으면 글이 대본 요약처럼 흐를 수 있다.", "핵심 용어를 기능, 문제 상황, 확인 기준으로 나누어 정리했다.", "검증 기준은 개념을 나열하지 않고 차이를 설명할 수 있는지다."),
-        ("학습 내용을 포트폴리오 설명으로 변환", "강의 수강 기록만으로는 실무적 사고 과정이 드러나지 않는다.", "포트폴리오에는 학습자가 어떤 문제를 해결했는지가 보여야 한다.", "문제 인식, 원인 판단, 조치, 검증 결과 흐름으로 재구성했다.", "검증 기준은 글만 읽어도 어떤 문제를 어떻게 해결했는지 보이는지다."),
+        (f"{first}를 실제 처리 순서로 풀어 보기", f"처음에는 {first}가 정의로는 이해되지만 실제 문제에서 어떤 순서로 적용해야 하는지 분명하지 않았다.", f"{first}를 단독 용어로 보면 입력, 조건, 실행 단계, 결과 확인이 분리되지 않는다.", f"먼저 입력이나 요청을 확인하고, {first}가 개입하는 지점을 찾은 뒤, 적용 단계와 결과 확인 질문을 차례로 세웠다.", f"검증 기준은 {first}를 설명할 때 정의보다 먼저 적용 순서를 말할 수 있는지다."),
+        (f"{first}와 {second}의 경계 구분", f"{first}와 {second}가 함께 등장하면 둘의 역할이 섞여 보일 수 있었다.", "역할 경계가 흐리면 실제 실습이나 문제 풀이에서 어떤 것을 먼저 확인해야 하는지 판단하기 어렵다.", f"{first}는 어떤 문제를 처리하고 {second}는 어느 단계에서 보완하는지 순서대로 나누었다.", "확인 기준은 두 개념을 나열하지 않고 서로 다른 역할과 연결 순서를 설명할 수 있는지다."),
+        (f"{third}로 이해 여부 확인", "개념을 읽는 것과 실제로 적용 가능한 상태는 다르다.", "마지막 확인 질문이 없으면 학습이 선언적인 정리로 끝날 수 있다.", f"{third}를 기준으로 내가 어떤 입력에서 무엇을 확인하고 어떤 결과가 나오면 이해했다고 볼지 정리했다.", "검증 기준은 같은 유형의 문제를 다시 만났을 때 적용 순서를 재현할 수 있는지다."),
     ]
 
 
@@ -2435,9 +3235,13 @@ def youtube_learner_complex_experience(title: str, terms: list[str], sections: l
 
 또 하나 어려웠던 지점은 배열, 인덱스, 탐색, 삽입, 삭제 같은 개념을 서로 따로 보지 않고 연산 비용과 연결하는 것이었다. 배열은 인덱스로 접근할 때는 직관적이지만, 특정 값을 찾거나 중간에 값을 넣고 빼는 상황에서는 비용이 달라질 수 있다. 이 차이를 이해해야 단순히 자료구조의 이름을 말하는 수준을 넘어, 왜 어떤 문제에서는 배열이 적합하고 어떤 문제에서는 다른 구조가 필요한지 설명할 수 있다. 이번 학습에서는 각 개념을 ‘무엇인가’보다 ‘언제 문제가 되고, 어떤 비용 기준으로 판단해야 하는가’로 정리하면서 이해를 검증했다."""
     if profile == "git_github":
-        return """가장 복잡했던 부분은 Git과 GitHub를 단순 명령어 묶음으로 보지 않고, 변경 이력 관리와 협업 흐름의 문제로 이해하는 일이었다. 처음에는 commit, branch, merge, remote, push, pull이 각각 따로 떨어진 명령처럼 보일 수 있다. 하지만 실제 프로젝트에서는 이 명령들이 모두 ‘변경 사항을 안전하게 기록하고, 실험 작업을 분리하고, 검증된 결과만 공유한다’는 하나의 문제 해결 흐름으로 연결된다.
+        return """가장 복잡했던 부분은 Git/GitHub 명령을 ‘왜 필요한가’로만 이해하는 것이 아니라, 실제 작업 순서로 연결하는 일이었다. 먼저 작업 전 `git status`로 변경 상태를 확인하고, 관련 있는 수정만 stage한 뒤 의미 있는 단위로 commit을 남긴다. 이후 새 기능이나 실험은 main에서 바로 진행하지 않고 branch를 만들어 분리한다. 이렇게 해야 문제가 생겼을 때 어느 변경을 되돌릴지, 어떤 작업이 아직 검증 전인지 추적할 수 있다.
 
-특히 branch와 merge는 단순히 가지를 만들고 합치는 기능이 아니라, 실험 코드와 안정적인 코드를 분리하기 위한 장치로 이해해야 했다. 원격 저장소는 백업 위치가 아니라 팀원이 같은 기준으로 변경 사항을 확인하고 리뷰할 수 있게 만드는 협업 기준점이었다. 그래서 이번 학습에서는 명령어 사용법보다 각 명령이 어떤 실패를 막는지, 그리고 실제 협업에서 어떤 순서로 연결되는지를 중심으로 정리했다."""
+그다음 흐름은 remote와 Pull Request로 이어진다. 로컬 branch에서 commit을 쌓은 뒤 remote branch로 push하고, Pull Request에서 변경 내용과 충돌 가능성을 확인한 다음 merge한다. 이 순서로 보니 commit, branch, merge, remote, push, pull은 따로 떨어진 명령이 아니라 `상태 확인 → 작업 분리 → 변경 기록 → 원격 공유 → 리뷰 → 병합`이라는 하나의 협업 절차로 연결됐다. 이번 학습에서는 이 절차를 기준으로 Git/GitHub를 설명할 수 있게 정리했다."""
+    if profile == "function_calling_tools":
+        return """가장 복잡했던 부분은 RAG와 AI Agent를 같은 LLM 응용으로 묶어 보지 않고, 실제 요청을 처리하는 순서로 나누는 일이었다. RAG는 사용자의 질문에 답하기 위해 관련 문서를 찾아 근거를 보강하는 구조이고, function calling은 모델이 외부 도구를 선택해 필요한 인자를 만들고 실행 결과를 다시 받아오는 구조다. 그래서 나는 먼저 요청을 보고 ‘지식 검색으로 충분한가, 외부 시스템을 호출해야 하는가’를 판단하는 순서로 정리했다.
+
+Function Calling도 단순히 모델이 함수를 부른다는 말로 끝나지 않았다. 실제로는 도구 이름, 설명, 입력 스키마, 필수 인자, 반환값을 명확히 정의해야 모델이 안정적으로 도구를 선택할 수 있다. 이후에는 도구 호출 결과가 비어 있는지, 오류가 있는지, 추가 호출이 필요한지 확인해야 한다. 이번 학습에서는 function calling을 ‘도구 선택 → 인자 구성 → 실행 → 결과 검증 → 답변 반영’이라는 절차로 이해하면서, RAG에서 agent로 넘어갈 때 무엇이 추가되는지 구체적으로 정리했다."""
     if profile == "vector_retrieval":
         return """가장 복잡했던 부분은 벡터 데이터베이스, 임베딩, semantic search, hybrid retrieval을 서로 다른 유행어로 받아들이지 않고 검색 품질 문제의 해결 단계로 구분하는 일이었다. 키워드 검색은 정확한 단어가 포함된 문서를 찾는 데 유리하지만, 사용자의 질문과 문서가 같은 표현을 쓰지 않으면 관련 내용을 놓칠 수 있다. 반대로 의미 기반 검색은 표현이 달라도 가까운 의미를 찾을 수 있지만, 고유명사나 정확한 조건이 중요한 상황에서는 키워드 신호가 여전히 필요하다.
 
@@ -2451,9 +3255,9 @@ def youtube_learner_complex_experience(title: str, terms: list[str], sections: l
 
 또한 VS Code, GitHub SDK, sandbox, plugin, MCP 같은 요소는 각각의 도구 이름으로만 보면 흩어진 키워드처럼 보인다. 하지만 학습자의 관점에서는 이것들이 에이전트가 안전하게 작업하고, 외부 시스템과 연결되며, 변경 사항을 검증 가능한 방식으로 남기기 위한 구조로 연결된다. 이번 학습에서는 에이전트가 무엇을 대신 수행할 수 있는지보다, 그 작업을 신뢰하려면 어떤 검토 기준과 운영 제약이 필요한지를 중심으로 정리했다."""
     focus = ", ".join(terms[:5]) if terms else "강의의 핵심 개념"
-    return f"""가장 복잡했던 부분은 {focus}를 단순히 강의에서 나온 용어로 받아들이지 않고, 실제 학습자가 설명할 수 있는 문제 해결 기준으로 바꾸는 일이었다. 강의에서는 여러 개념이 순서대로 등장하지만, 학습 과정에서는 각 개념이 어떤 문제를 해결하고 어떤 상황에서 필요한지 구분해야 한다. 그래서 이번 학습에서는 핵심 개념을 정의, 필요성, 적용 조건, 확인 질문으로 나누어 정리했다.
+    return f"""가장 복잡했던 부분은 {focus}를 실제 문제를 푸는 순서로 연결하는 일이었다. 먼저 어떤 입력이나 요청이 주어지는지 확인하고, 그다음 어떤 개념이 문제 해결에 직접 필요한지 골라야 했다. 이후 선택한 개념이 어떤 조건에서 동작하고 어떤 한계를 갖는지 확인하면서 풀이 또는 실습 절차를 정리했다.
 
-이 과정에서 중요한 기준은 ‘내가 이 개념을 다시 설명할 수 있는가’였다. 단순히 영상을 끝까지 본 것만으로는 이해를 검증하기 어렵기 때문에, 각 개념이 해결하는 문제와 실제 적용 기준을 따로 적어 보면서 학습 내용을 점검했다. 이를 통해 {core_problem}이라는 학습 과제를 더 구체적인 설명 단위로 나눌 수 있었다."""
+그래서 이번 학습에서는 {focus}를 정의로만 정리하지 않고 `상황 확인 → 적용할 개념 선택 → 처리 절차 정리 → 결과 검증` 순서로 다시 설명했다. 이를 통해 {core_problem}이라는 학습 과제를 실제로 어떻게 풀어야 하는지 더 구체적인 단계로 나눌 수 있었다."""
 
 
 def youtube_learner_outcome(title: str, terms: list[str], transcript_text: str, core_problem: str) -> str:
@@ -2515,6 +3319,130 @@ def youtube_learner_problem_sections(title: str, terms: list[str], transcript_te
     """
     profile = youtube_topic_profile(title, transcript_text)
     term_text = ", ".join(terms[:5]) if terms else "핵심 개념"
+    if profile == "network_devices":
+        return {
+            "intro": f"""이번 학습에서는 `{title}` 강의를 보며 Hub, Switch, Router를 모두 네트워크 장비라는 하나의 이름으로 묶지 않고, 트래픽을 어디까지 어떻게 전달하는지에 따라 구분하는 데 집중했다. 세 장비는 모두 장치를 연결하지만, 목적지를 판단하는 수준과 네트워크 경계를 다루는 방식이 다르다.
+
+그래서 이번 기록은 Hub는 모두에게 뿌리는 장비, Switch는 같은 네트워크 안에서 MAC 주소를 기준으로 필요한 포트로 보내는 장비, Router는 서로 다른 네트워크 사이에서 IP 경로를 선택하는 장비로 정리했다.""",
+            "problem_awareness": f"""처음 헷갈린 부분은 Hub, Switch, Router가 모두 네트워크 장비라서 겉으로는 비슷해 보인다는 점이었다. 하지만 실제 차이는 장비 이름이 아니라 트래픽을 전달할 때 목적지를 얼마나 판단하는가에 있었다.
+
+이번 영상의 중심 문제는 `{core_problem}`이었다. Hub는 전달 대상을 좁히지 못하고, Switch는 같은 네트워크 안에서 MAC 주소를 학습해 전달하며, Router는 네트워크 경계를 넘어 IP 기반으로 경로를 선택한다는 차이를 잡아야 했다.""",
+            "problem_definition": """내가 정의한 문제는 세 장비를 속도나 가격 차이가 아니라 전달 범위와 판단 기준으로 구분하는 것이었다. Hub는 들어온 신호를 연결된 포트 전체로 전달하는 방식이고, Switch는 MAC 주소를 기준으로 필요한 포트를 찾아 보낸다. Router는 같은 네트워크 안의 포트 선택이 아니라 다른 네트워크로 나가기 위한 경로 선택 문제를 다룬다.
+
+이렇게 정리하면 네트워크 장비를 외우는 방식이 아니라, 현재 통신이 같은 네트워크 안에서 일어나는지, 다른 네트워크로 나가야 하는지, 장비가 MAC 주소를 보는지 IP 주소를 보는지 순서로 판단할 수 있다.""",
+            "why": """나는 먼저 통신 범위를 기준으로 문제를 나누었다. 같은 네트워크 안에서 장치들이 연결되어 있을 때는 Hub와 Switch의 차이가 중요하고, 다른 네트워크로 나가야 할 때는 Router의 역할이 필요해진다.
+
+그다음 확인 기준을 전달 방식으로 잡았다. 모든 포트로 보내면 Hub, 목적지 MAC 주소를 학습해 특정 포트로 보내면 Switch, IP 주소와 라우팅을 기준으로 다른 네트워크로 보내면 Router라고 설명할 수 있어야 한다.""",
+            "final": """이번 학습을 통해 Hub, Switch, Router를 장비 이름이 아니라 트래픽 전달 방식으로 구분할 수 있게 되었다. Hub는 전달 대상을 좁히지 못하고, Switch는 MAC 주소를 기준으로 같은 네트워크 안의 전달을 최적화하며, Router는 네트워크 간 이동을 담당한다.
+
+앞으로 네트워크 구조를 볼 때도 먼저 같은 네트워크 내부 통신인지, 네트워크 간 통신인지, 장비가 어떤 주소 정보를 기준으로 판단하는지 확인하는 순서로 복습할 수 있다.""",
+            "portfolio": """This learning record explains Hub, Switch, and Router as traffic-forwarding decisions rather than isolated device names. I focused on how each device handles destination awareness, network boundaries, and forwarding scope.
+
+The key outcome was learning to explain the difference as a practical troubleshooting rule: Hub broadcasts broadly, Switch narrows delivery using MAC information, and Router forwards traffic between networks using IP routing.""",
+            "skills": """- Distinguishing Hub, Switch, and Router by forwarding behavior
+- Explaining broadcast-style traffic delivery
+- Understanding MAC-based switching
+- Understanding IP-based routing
+- Separating same-network traffic from inter-network traffic
+- Explaining network device roles with practical criteria
+- Building troubleshooting questions for network diagrams
+- Avoiding device-name memorization
+- Connecting network concepts to traffic flow
+- Writing learner-centered networking notes""",
+        }
+    if profile == "network_layers":
+        return {
+            "intro": f"""이번 학습에서는 `{title}` 강의를 보며 Layer 2 Switch와 Layer 3 Switch를 이름이 비슷한 장비로 외우는 대신, 어떤 주소 체계로 트래픽을 전달하는지에 따라 구분하는 데 집중했다. Layer 2는 MAC 주소 기반 switching이고, Layer 3는 IP 주소 기반 routing 판단까지 포함한다.
+
+그래서 이번 기록은 L2/L3를 숫자 계층으로만 외우는 것이 아니라, 프레임 전달, VLAN, IP routing, 네트워크 경계 문제로 연결해 정리했다.""",
+            "problem_awareness": f"""처음 부딪힌 문제는 Layer 2 Switch와 Layer 3 Switch가 모두 switch라는 이름을 갖고 있어서 역할이 섞여 보인다는 점이었다. 하지만 실제 구분 기준은 장비 이름이 아니라 어떤 계층의 주소를 보고 전달 결정을 하느냐였다.
+
+이번 영상의 중심 문제는 `{core_problem}`이었다. 같은 네트워크 안에서 MAC 주소를 기준으로 전달하는 문제와, VLAN이나 다른 네트워크 사이에서 IP 기반 routing이 필요한 문제를 구분해야 했다.""",
+            "problem_definition": """내가 정의한 문제는 Layer 2 switching과 Layer 3 routing을 전달 기준, 사용 위치, 검증 질문으로 나누어 설명하는 것이었다. Layer 2 Switch는 같은 LAN 안에서 MAC 주소 테이블을 기준으로 프레임을 전달한다. Layer 3 Switch는 여기에 IP 기반 routing 기능이 더해져 VLAN 간 통신이나 내부 네트워크 간 전달을 처리할 수 있다.
+
+이렇게 정리하면 L2/L3 차이를 단순 성능 차이가 아니라, MAC 주소 기반 전달인지 IP 주소 기반 경로 선택인지로 설명할 수 있다.""",
+            "why": """나는 먼저 통신이 같은 VLAN 안에서 끝나는지, 다른 VLAN 또는 다른 네트워크로 넘어가야 하는지 확인하는 순서로 이해했다. 같은 네트워크 내부라면 Layer 2 switching 기준이 중요하고, 네트워크 경계를 넘어야 한다면 Layer 3 routing 판단이 필요하다.
+
+검증 질문은 '이 장비가 MAC 주소만 보고 전달하는가, IP 주소와 라우팅 테이블까지 보는가'로 잡았다. 이 질문으로 Layer 2 Switch, Layer 3 Switch, Router의 역할 경계를 더 명확히 구분할 수 있었다.""",
+            "final": """이번 학습을 통해 Layer 2와 Layer 3 Switch를 계층 이름이 아니라 전달 판단 기준으로 이해할 수 있었다. Layer 2는 MAC 주소 기반 switching, Layer 3는 IP routing까지 포함하는 구조로 정리했다.
+
+앞으로 네트워크 설계를 볼 때도 먼저 VLAN 내부 통신인지, VLAN 간 통신인지, 외부 네트워크로 나가는 트래픽인지 확인하고 그에 맞는 장비 역할을 설명할 수 있다.""",
+            "portfolio": """This learning record explains Layer 2 and Layer 3 switches through forwarding criteria. I focused on the practical distinction between MAC-based switching and IP-based routing rather than memorizing device names.
+
+The key outcome was learning to reason through network design questions: identify whether traffic stays within a LAN/VLAN, determine whether routing is required, and then decide whether Layer 2 switching or Layer 3 switching is involved.""",
+            "skills": """- Distinguishing Layer 2 and Layer 3 switching
+- Explaining MAC-based forwarding
+- Explaining IP-based routing
+- Understanding VLAN and inter-VLAN routing
+- Separating switching from routing decisions
+- Reading network device roles by traffic scope
+- Building validation questions for network diagrams
+- Connecting OSI layers to practical forwarding
+- Avoiding shallow terminology memorization
+- Writing technical networking explanations""",
+        }
+    if profile == "github_copilot_internals":
+        return {
+            "intro": f"""이번 학습에서는 `{title}` 강의를 보며 GitHub Copilot을 Git 명령어가 아니라 개발자가 작성 중인 코드 맥락을 바탕으로 제안을 만드는 AI 개발 보조 시스템으로 이해하는 데 집중했다. GitHub라는 이름 때문에 저장소 관리나 branch 흐름으로 오해하기 쉽지만, 이 강의의 중심은 Copilot이 어떤 컨텍스트를 보고 제안을 만들고, 개발자가 그 결과를 어떻게 검토해야 하는가에 있다.
+
+그래서 이번 기록은 Copilot을 '자동으로 코드를 써주는 도구'로 보지 않고, 컨텍스트 입력 → 후보 제안 → 개발자 검토 → 테스트와 수정이라는 사용 흐름으로 정리했다.""",
+            "problem_awareness": f"""처음 부딪힌 문제는 Copilot 제안이 그럴듯해 보여도 곧바로 정답으로 볼 수 없다는 점이었다. AI가 만든 코드는 요구사항을 일부만 반영하거나, 주변 코드 스타일과 맞지 않거나, 보안·성능·예외 처리를 놓칠 수 있다.
+
+이번 영상의 중심 문제는 `{core_problem}`이었다. Copilot을 제대로 쓰려면 어떤 정보를 바탕으로 제안이 만들어지는지, 그리고 제안 이후 사람이 어떤 기준으로 검토해야 하는지 분리해야 했다.""",
+            "problem_definition": """내가 정의한 문제는 Copilot의 결과를 완성 코드가 아니라 검토 가능한 초안으로 다루는 것이었다. Copilot은 열린 파일, 주변 코드, 주석, 함수명, 프롬프트 같은 컨텍스트를 바탕으로 후보를 만들 수 있지만, 그 후보가 프로젝트 목적에 맞는지는 개발자가 확인해야 한다.
+
+따라서 이해 기준은 'Copilot이 코드를 만들었다'가 아니라, 어떤 컨텍스트를 줬고, 어떤 제안을 받았고, 그 제안을 테스트·리뷰·수정으로 어떻게 검증했는지로 잡았다.""",
+            "why": """나는 Copilot 사용 흐름을 먼저 문제 정의에서 시작했다. 만들고 싶은 기능이나 수정하려는 코드의 의도를 명확히 하고, 그 의도가 주석·함수명·주변 코드에 드러나도록 한 뒤 제안을 받아야 한다.
+
+그다음 제안 코드는 실행 가능성, 테스트 통과 여부, 예외 처리, 보안 영향, 기존 코드 스타일과의 일관성을 기준으로 확인한다. 이 흐름을 통해 Copilot은 대체자가 아니라 초안 작성과 반복 수정을 빠르게 해주는 보조 도구로 이해할 수 있었다.""",
+            "final": """이번 학습을 통해 GitHub Copilot을 Git/GitHub 명령 흐름이 아니라 AI 코드 제안 시스템으로 구분할 수 있었다. 핵심은 제안이 만들어지는 컨텍스트를 관리하고, 생성된 코드를 개발자가 검토 가능한 변경으로 다루는 것이다.
+
+앞으로 Copilot을 사용할 때도 단순히 제안을 수락하는 것이 아니라, 문제 정의를 명확히 하고 컨텍스트를 정리한 뒤 테스트와 리뷰로 결과를 검증하는 순서로 활용할 수 있다.""",
+            "portfolio": """This learning record explains GitHub Copilot as an AI coding assistant grounded in code context, not as a Git/GitHub version-control workflow. I focused on how suggestions are produced, why they must be reviewed, and how developers can integrate them safely into their workflow.
+
+The key outcome was learning to treat Copilot output as a draft: clarify intent, provide useful context, review the generated code, test behavior, and keep responsibility for the final implementation.""",
+            "skills": """- Understanding GitHub Copilot as an AI coding assistant
+- Separating Copilot from Git version-control workflows
+- Managing code context for better suggestions
+- Reviewing AI-generated code critically
+- Validating suggestions with tests and edge cases
+- Thinking about security and maintainability
+- Integrating Copilot into developer workflow
+- Avoiding blind acceptance of generated code
+- Explaining AI coding tools in portfolio language
+- Maintaining developer ownership of final code""",
+        }
+    if profile == "copilot_workback":
+        return {
+            "intro": f"""이번 학습에서는 `{title}` 강의를 보며 Copilot으로 마케팅 이벤트 workback 계획을 만드는 과정을 단순 일정 생성이 아니라 목표 날짜에서 역산해 작업과 의존성을 구조화하는 문제로 이해했다. workback은 할 일을 나열하는 목록이 아니라, 최종 이벤트까지 필요한 준비 과정을 시간순으로 검증하는 계획이다.
+
+그래서 이번 기록은 Copilot이 만들어 준 결과를 그대로 받아들이는 것이 아니라, 목표, 마감일, 작업 단계, 의존성, 검토 지점을 어떻게 확인해야 하는지 중심으로 정리했다.""",
+            "problem_awareness": f"""처음 부딪힌 문제는 이벤트 계획이 보기에는 단순 일정표처럼 보여도 실제로는 작업 간 선후관계가 많다는 점이었다. 홍보물 제작, 승인, 초대, 리허설, 당일 운영은 서로 연결되어 있어서 하나가 늦어지면 전체 일정이 흔들릴 수 있다.
+
+이번 영상의 중심 문제는 `{core_problem}`이었다. Copilot이 생성한 workback을 실행 가능한 계획으로 쓰려면 각 작업이 어떤 목표와 연결되고, 어떤 마감일과 의존성을 갖는지 검토해야 했다.""",
+            "problem_definition": """내가 정의한 문제는 Copilot을 이용해 이벤트 목표에서 거꾸로 필요한 작업을 도출하고, 그 작업을 실행 가능한 일정과 검증 기준으로 바꾸는 것이었다. 단순히 '마케팅 이벤트 계획을 만들어 줘'라고 요청하면 목록은 나올 수 있지만, 그 목록이 실제 운영 가능한지는 따로 확인해야 한다.
+
+그래서 목표 날짜, 핵심 산출물, 담당자, 승인 지점, 작업 간 의존성을 기준으로 workback을 다시 점검하는 흐름으로 정리했다.""",
+            "why": """나는 먼저 최종 이벤트 날짜와 성공 기준을 기준점으로 잡았다. 그다음 이벤트 전까지 필요한 산출물을 나열하고, 각 산출물을 만들기 위해 필요한 작업을 역순으로 배치했다.
+
+마지막으로 Copilot이 제안한 항목이 실행 가능한지 확인했다. 담당자가 빠져 있거나, 승인 단계가 없거나, 선행 작업 없이 후속 작업이 먼저 배치되어 있으면 실제 계획으로 쓰기 어렵기 때문에, 생성 결과를 일정·담당자·의존성·승인 기준으로 검토하는 방식이 필요했다.""",
+            "final": """이번 학습을 통해 Copilot을 단순 일정 생성기가 아니라 workback 계획의 초안을 만들고 검토하는 도구로 이해할 수 있었다. 중요한 것은 생성된 목록을 그대로 사용하는 것이 아니라, 목표 날짜에서 역산해 작업 순서와 의존성을 확인하는 것이다.
+
+앞으로 이벤트나 프로젝트 계획을 만들 때도 먼저 최종 목표를 정하고, 산출물과 마감일을 기준으로 작업을 나눈 뒤, Copilot 결과를 실행 가능한 계획으로 검토하는 흐름을 적용할 수 있다.""",
+            "portfolio": """This learning record frames Copilot-generated workbacks as planning drafts that must be validated against event goals, deadlines, dependencies, owners, and approval points. I focused on how to turn a generated list into an executable event plan.
+
+The key outcome was learning to use Copilot for structured planning: define the target event, work backward from the deadline, break tasks into phases, check dependencies, and refine the output into an actionable workback.""",
+            "skills": """- Structuring marketing event workbacks
+- Working backward from deadlines
+- Reviewing AI-generated plans critically
+- Identifying task dependencies
+- Checking owners, milestones, and approvals
+- Turning Copilot output into executable plans
+- Separating generated drafts from validated plans
+- Applying Copilot to project coordination
+- Building validation criteria for planning workflows
+- Writing practical learning notes from business-app demos""",
+        }
     if profile == "data_structure_algorithm":
         return {
             "intro": f"""이번 학습에서는 `{title}` 강의를 보며 자료구조와 알고리즘을 단순 정의가 아니라 실제 문제를 풀 때의 선택 기준으로 이해하는 데 집중했다. 처음에는 시간 복잡도, 공간 복잡도, 빅오, 배열, 인덱스 같은 개념이 각각 떨어진 용어처럼 보였지만, 강의 흐름을 따라가면서 이 개념들이 모두 ‘입력 조건이 달라질 때 어떤 방식으로 데이터를 다룰 것인가’라는 하나의 문제로 연결된다는 점을 확인했다.
@@ -2526,9 +3454,9 @@ def youtube_learner_problem_sections(title: str, terms: list[str], transcript_te
             "problem_definition": f"""내가 정의한 문제는 자료구조와 알고리즘을 ‘무엇인가’로 설명하는 수준에서 벗어나, 입력 조건과 연산 비용에 따라 선택할 수 있는 판단 체계로 정리하는 것이었다. 예를 들어 배열은 인덱스를 통한 접근이 직관적이지만, 탐색이나 중간 삽입·삭제가 필요한 상황에서는 비용이 달라질 수 있다. 따라서 배열을 배웠다는 것은 배열의 이름을 아는 것이 아니라, 어떤 연산에서 유리하고 어떤 연산에서 부담이 생기는지를 말할 수 있어야 한다는 뜻이다.
 
 이 문제를 해결하기 위해 학습 기준을 세 가지로 나누었다. 첫째, 입력 크기가 커질 때 실행 시간이 어떻게 변하는지 시간 복잡도로 판단한다. 둘째, 풀이 과정에서 필요한 추가 메모리를 공간 복잡도로 확인한다. 셋째, 배열·스택·큐·트리·그래프 같은 자료구조를 연산 비용과 연결해 비교한다. 이 기준이 있어야 알고리즘을 외운 것이 아니라 문제 조건에 맞게 선택했다고 말할 수 있다.""",
-            "why": f"""이 문제를 중요하게 본 이유는 알고리즘 학습에서 가장 흔한 착각이 ‘정답 코드를 이해했다’와 ‘문제 조건에 맞는 풀이를 선택할 수 있다’를 같은 것으로 보는 데 있기 때문이다. 코드가 한 번 실행되는 것만으로는 충분하지 않다. 입력이 커졌을 때 시간이 얼마나 늘어나는지, 메모리를 얼마나 쓰는지, 특정 자료구조를 선택한 이유가 무엇인지 설명할 수 있어야 한다.
+            "why": f"""나는 먼저 입력 크기를 잡고, 그 입력이 커질 때 반복 횟수가 어떻게 늘어나는지 세어 보았다. 그다음 시간 복잡도와 공간 복잡도를 분리해 실행 시간의 증가와 추가 메모리 사용을 따로 판단했다. 배열을 볼 때도 “배열이 무엇인가”가 아니라 인덱스 접근, 전체 탐색, 중간 삽입·삭제가 각각 어떤 비용을 만드는지 순서대로 확인했다.
 
-또한 자료구조와 알고리즘은 면접이나 코딩 테스트에서만 쓰이는 지식이 아니다. 실제 개발에서도 데이터가 많아지거나 응답 시간이 중요해지는 순간, 어떤 구조로 데이터를 저장하고 어떤 방식으로 탐색할지 결정해야 한다. 그래서 이번 학습에서는 개념 이름보다 선택 이유와 검증 기준을 더 중요하게 보았다.""",
+이렇게 접근하니 알고리즘 선택이 선언적인 설명에서 벗어났다. 문제를 만나면 입력 크기 → 자주 수행되는 연산 → 필요한 자료구조 → 예상 복잡도 → 검증 질문 순서로 풀 수 있다. 이번 학습에서 세운 확인 질문은 “이 풀이가 입력 제한을 버틸 수 있는가”, “이 자료구조의 장점이 현재 연산 패턴과 맞는가”, “더 큰 입력에서도 같은 방식이 유지되는가”였다.""",
             "final": f"""이번 학습을 통해 자료구조와 알고리즘을 단순 암기 과목이 아니라 문제 조건을 읽고 풀이 비용을 판단하는 기준으로 다시 정리했다. 시간 복잡도와 공간 복잡도는 코드의 성능을 사후에 설명하는 용어가 아니라, 풀이를 설계하기 전에 선택지를 비교하는 기준으로 이해했다.
 
 앞으로 알고리즘 문제를 풀 때는 먼저 입력 크기, 필요한 연산, 메모리 제약을 확인하고 그 조건에 맞는 자료구조를 선택하는 흐름으로 복습할 수 있다. 이번 학습의 성과는 개념을 많이 외운 것이 아니라, 왜 특정 자료구조와 알고리즘이 필요한지 설명할 수 있는 기준을 만든 데 있다.""",
@@ -2557,9 +3485,9 @@ The key outcome was building a clearer explanation framework: identify the input
             "problem_definition": f"""내가 정의한 문제는 Git과 GitHub의 기능을 개별 명령어가 아니라 변경 이력 관리와 협업 검증 흐름으로 연결하는 것이었다. 파일을 수정하고 저장하는 것만으로는 언제 무엇이 바뀌었는지, 문제가 생겼을 때 어디로 되돌아가야 하는지, 다른 사람의 변경과 어떻게 합쳐야 하는지 관리하기 어렵다.
 
 이 문제를 해결하기 위해 commit은 변경 이력을 고정하는 단위, branch는 작업을 분리하는 장치, merge는 검증된 변경을 합치는 과정, remote/GitHub는 변경 사항을 공유하고 리뷰하는 기준점으로 정리했다. 이렇게 연결해야 Git/GitHub를 단순 도구가 아니라 개발 workflow로 설명할 수 있다.""",
-            "why": f"""이 문제를 중요하게 본 이유는 포트폴리오 프로젝트에서도 Git 사용 여부보다 작업을 어떤 단위로 나누고 기록했는지가 더 중요하기 때문이다. commit 메시지가 모호하거나 branch 없이 모든 작업을 한 흐름에서 처리하면, 나중에 오류가 생겼을 때 원인을 추적하기 어렵다.
+            "why": f"""나는 Git 흐름을 명령어 이름이 아니라 작업 순서로 다시 잡았다. 먼저 `git status`로 현재 변경 상태를 확인하고, 관련 있는 수정만 stage한 뒤, 하나의 의미 단위로 commit을 남긴다. 새 기능이나 실험은 main에서 바로 진행하지 않고 branch를 만든 뒤 그 안에서 수정과 commit을 반복한다.
 
-또한 협업에서는 내가 만든 코드가 원격 저장소에 올라가는 것만으로 끝나지 않는다. 변경 사항을 공유하고, 리뷰하고, 충돌을 해결하고, 안정적인 코드에 반영하는 기준이 필요하다. 그래서 Git/GitHub 학습은 명령어 암기가 아니라 협업 가능한 개발 습관을 만드는 문제로 인식했다.""",
+그다음 로컬 변경을 remote branch로 push하고 Pull Request에서 변경 내용을 검토한 뒤 merge하는 순서로 연결했다. 이 흐름으로 보니 commit, branch, merge, remote, push, pull은 따로 외우는 명령이 아니라 상태 확인 → 작업 분리 → 변경 기록 → 원격 공유 → 리뷰 → 병합이라는 하나의 처리 절차가 되었다.""",
             "final": """이번 학습을 통해 Git과 GitHub를 변경 이력 관리와 협업 흐름의 기준으로 정리할 수 있었다. commit, branch, merge, remote, push, pull을 각각 따로 외우는 대신, 변경 사항을 안전하게 기록하고 실험 작업을 분리하며 검증된 결과를 공유하는 하나의 흐름으로 이해했다.
 
 앞으로 포트폴리오 프로젝트를 관리할 때도 단순히 코드를 올리는 것이 아니라, 작업 단위를 branch로 나누고 commit으로 변경 이유를 남기며 원격 저장소를 기준으로 협업 가능한 흐름을 구성하는 방식으로 적용할 수 있다.""",
@@ -2588,9 +3516,9 @@ The key outcome was building a practical explanation of Git/GitHub as a developm
             "problem_definition": f"""내가 정의한 문제는 검색 시스템에서 표현 불일치, 의미 유사도, 정확한 키워드 조건을 어떻게 함께 다룰지 이해하는 것이었다. 임베딩은 문장과 문서를 의미 공간의 벡터로 바꾸고, 벡터 데이터베이스는 그 벡터를 저장한 뒤 유사도 기반으로 가까운 문서를 찾는다. 하지만 모든 문제를 의미 기반 검색만으로 해결할 수 있는 것은 아니다.
 
 따라서 semantic search는 표현이 달라도 관련 문서를 찾기 위한 방식으로, hybrid retrieval은 키워드 신호와 의미 신호를 함께 사용해 검색 누락과 부정확한 랭킹을 줄이는 전략으로 정리했다. 이 구분이 있어야 RAG 시스템에서 검색 계층을 단순 부가 기능이 아니라 답변 품질의 출발점으로 설명할 수 있다.""",
-            "why": f"""이 문제를 중요하게 본 이유는 RAG 시스템에서 LLM이 아무리 좋아도 검색된 근거가 부정확하면 답변 품질이 흔들리기 때문이다. 관련 문서가 검색되지 않으면 모델은 필요한 정보를 갖지 못하고, 관련 없는 문서가 상위에 오르면 답변은 그럴듯하지만 실제 요구와 어긋날 수 있다.
+            "why": f"""나는 검색 문제를 먼저 “같은 단어를 찾는 문제”와 “같은 의미를 찾는 문제”로 나누었다. 키워드 검색은 정확한 용어와 조건을 지키는 데 유리하고, 임베딩 기반 semantic search는 표현이 달라도 의미가 가까운 문서를 찾는 데 유리하다. 그다음 두 방식 중 하나만 고르는 대신 hybrid retrieval로 결합하는 흐름을 잡았다.
 
-또한 벡터 데이터베이스라는 단어만으로는 검색 품질을 보장할 수 없다. 어떤 임베딩을 사용했는지, 쿼리를 어떻게 구성했는지, 키워드 신호를 함께 쓸지, 결과를 어떻게 평가할지까지 연결해야 실제 AI 서비스에서 사용할 수 있는 검색 구조가 된다.""",
+실제로 적용할 때는 문서를 임베딩으로 변환하고, 벡터 데이터베이스에 저장한 뒤, 사용자 질문도 같은 방식으로 벡터화해 유사도 검색을 수행한다. 이후 고유명사나 정확한 조건이 필요한 쿼리는 키워드 신호와 함께 비교한다. 마지막 검증 질문은 “검색 결과가 질문의 표현만 닮은 것인가, 실제 답변 근거로 쓸 수 있는 문서인가”였다.""",
             "final": """이번 학습을 통해 벡터 데이터베이스와 임베딩을 RAG 검색 품질을 높이기 위한 구조로 이해할 수 있었다. semantic search는 표현이 다른 관련 문서를 찾는 데 유리하고, hybrid retrieval은 의미 신호와 키워드 신호를 함께 사용해 정확도와 재현율을 보완하는 방식으로 정리했다.
 
 성과는 벡터 DB를 단순히 붙이는 기능으로 보지 않고, 검색 실패 유형과 평가 기준을 함께 고려해야 한다는 점을 학습한 것이다. 이후 RAG 프로젝트에서도 검색 결과의 관련성, 랭킹, 근거 충실도를 별도 검증 대상으로 다룰 수 있다.""",
@@ -2640,6 +3568,485 @@ The key outcome was turning lecture concepts into reusable explanation units: pr
 - Maintaining learner-centered technical writing""",
     }
 
+
+
+# --- Extraction baseline v1: current-run lecture evidence, not keyword profile ---
+
+YOUTUBE_CONCEPT_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "your", "you", "our", "are", "was", "were", "have", "has", "had",
+    "today", "video", "course", "module", "welcome", "hello", "right", "now", "goodbye", "using", "examples", "explained", "to",
+    "allowed", "solving", "hard", "problems", "complex", "codebases", "free", "day", "need", "use", "another", "project",
+}
+
+YOUTUBE_AMBIGUOUS_SINGLE_TERMS = {
+    "hub", "switch", "router", "service", "pod", "api", "rag", "tool", "loop", "node", "cluster", "context", "mac", "ip",
+}
+
+YOUTUBE_FALSE_POSITIVE_PATTERNS = [
+    ("Hub", re.compile(r"\bgithub\b", re.I), "GitHub contains hub but is not a network hub"),
+    ("Switch", re.compile(r"\bswitch(?:ing|ed)?\s+to\b", re.I), "switching to means changing tools, not a network switch"),
+    ("Router", re.compile(r"\bopenrouter\b", re.I), "OpenRouter is a service name, not a network router"),
+    ("MAC Address", re.compile(r"\b(macbook|machine|maybe)\b", re.I), "mac-like text is not a MAC address"),
+]
+
+
+def yt_phrase_in_text(phrase: str, text: str) -> bool:
+    """Whole phrase match. Prevents GitHub→Hub, switching→Switch, OpenRouter→Router."""
+    phrase = str(phrase or "").strip()
+    text = str(text or "")
+    if not phrase or not text:
+        return False
+    # For phrases with symbols, require boundary around the alnum edges.
+    escaped = re.escape(phrase)
+    return bool(re.search(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", text, flags=re.I))
+
+
+def yt_phrase_count(phrase: str, text: str) -> int:
+    phrase = str(phrase or "").strip()
+    if not phrase:
+        return 0
+    return len(re.findall(rf"(?<![A-Za-z0-9]){re.escape(phrase)}(?![A-Za-z0-9])", str(text or ""), flags=re.I))
+
+
+def yt_has_context(text: str, words: list[str]) -> bool:
+    low = str(text or "").lower()
+    return any(w.lower() in low for w in words)
+
+
+def yt_title_concepts(title: str, limit: int = 8) -> list[str]:
+    """Extract conservative concepts from the current video title only.
+
+    This is not domain classification. It only returns literal title phrases that
+    identify the lecture itself.
+    """
+    t = re.sub(r"\s+", " ", str(title or "")).strip()
+    low = t.lower()
+    out: list[str] = []
+    explicit = [
+        ("Kubernetes Architecture", ["kubernetes architecture"]),
+        ("Kubernetes", ["kubernetes", "k8s"]),
+        ("Tools & MCP Servers", ["tools & mcp servers", "tools and mcp servers"]),
+        ("MCP Servers", ["mcp servers", "mcp server"]),
+        ("Hermes", ["hermes"]),
+        ("OpenClaw", ["openclaw", "open claw"]),
+        ("Complex Codebases", ["complex codebases", "complex codebase"]),
+        ("Coding Agents", ["coding agents", "coding agent"]),
+        ("HumanLayer", ["humanlayer", "human layer"]),
+        ("No Vibes Allowed", ["no vibes allowed"]),
+        ("GitHub Copilot", ["github copilot"]),
+        ("Vector Databases", ["vector databases", "vector database"]),
+        ("Semantic Search", ["semantic search"]),
+        ("Hybrid Retrieval", ["hybrid retrieval", "hybrid search"]),
+        ("RAG Evaluation", ["rag and agents evaluation", "rag evaluation"]),
+        ("Hub, Switch, Router", ["hub, switch", "hub switch", "switch, & router", "switch and router"]),
+        ("Layer 2 vs Layer 3", ["layer 2 vs layer 3", "layer 2", "layer 3"]),
+    ]
+    for label, aliases in explicit:
+        if any(a in low for a in aliases):
+            out.append(label)
+    # Add proper title chunks only when explicit title concepts were not enough.
+    # This prevents clickbait chunks like "to Hermes OpenClaw" from becoming concepts.
+    if len(out) >= 2:
+        return unique_preserve_order(out, limit=limit)
+    cleaned = re.sub(r"[#|:()\[\]{}!?]", " ", t)
+    chunks = re.split(r"\s+[–—-]\s+|\s+\|\s+|\s*:\s*", cleaned)
+    for ch in chunks:
+        ch = re.sub(r"\s+", " ", ch).strip(" -_/.,")
+        if not ch or len(ch) < 6:
+            continue
+        words = [w for w in re.split(r"\s+", ch) if w.lower().strip(".,!?") not in YOUTUBE_CONCEPT_STOPWORDS]
+        if len(words) >= 2 and len(" ".join(words)) >= 10:
+            label = " ".join(words[:5]).strip()
+            if label and label not in out:
+                out.append(label)
+        if len(out) >= limit:
+            break
+    return unique_preserve_order(out, limit=limit)
+
+
+def yt_concept_context_ok(label: str, evidence: str, segments: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Context gate for ambiguous concepts.
+
+    It rejects terms that merely occur as substrings or generic everyday words.
+    """
+    label_l = label.lower()
+    evidence_l = str(evidence or "").lower()
+    joined = "\n".join(str(seg.get("text") or "") for seg in segments)
+
+    for fp_label, pat, reason in YOUTUBE_FALSE_POSITIVE_PATTERNS:
+        if fp_label.lower() == label_l and pat.search(joined):
+            # Only reject if there is no genuine standalone technical context.
+            if fp_label == "Hub" and not yt_has_context(joined, ["network hub", "ethernet hub", "broadcast", "collision domain"]):
+                return False, reason
+            if fp_label == "Switch" and not yt_has_context(joined, ["network switch", "layer 2", "ethernet", "frame", "mac address"]):
+                return False, reason
+            if fp_label == "Router" and not yt_has_context(joined, ["network router", "route packets", "routing", "ip address", "between networks"]):
+                return False, reason
+
+    network_context = ["network", "packet", "packets", "frame", "frames", "ethernet", "port", "ports", "lan", "vlan", "mac address", "ip address", "layer 2", "layer 3", "broadcast", "collision"]
+    k8s_context = ["kubernetes", "k8s", "cluster", "control plane", "worker node", "kubelet", "scheduler", "api server", "deployment", "container", "namespace"]
+    rag_context = ["retrieval", "retrieve", "retriever", "document", "documents", "answer quality", "evaluation", "query", "context", "ground truth"]
+    agent_context = ["agent", "agents", "tool call", "function calling", "mcp", "schema", "arguments", "execute", "observation", "coding agent"]
+
+    if label in {"Hub", "Switch", "Router", "MAC Address", "IP Address", "Layer 2", "Layer 3", "VLAN"}:
+        return yt_has_context(joined, network_context), "requires network context"
+    if label in {"Pod", "Service", "API Server", "Scheduler", "Controller Manager", "etcd", "kubelet", "kube-proxy", "Deployment", "Namespace", "Ingress", "Worker Node", "Control Plane", "Cluster"}:
+        return yt_has_context(evidence_l, k8s_context), "requires Kubernetes context"
+    if label == "RAG":
+        return (yt_phrase_in_text("RAG", evidence) or "retrieval-augmented" in evidence_l or "retrieval augmented" in evidence_l) and yt_has_context(evidence_l, rag_context), "requires exact RAG + retrieval context"
+    if label in {"Tool", "Tool Call", "Tool Schema", "Function Calling", "Agent Loop", "MCP Server", "MCP Servers"}:
+        return yt_has_context(evidence_l, agent_context), "requires agent/tool context"
+    if label == "API":
+        return yt_has_context(evidence_l, ["api server", "external api", "endpoint", "request", "response", "call the api", "apis"] + k8s_context + agent_context), "requires API context"
+    return True, "ok"
+
+
+def yt_extraction_report(title: str, transcript_text: str, source_pack_text: str = "") -> dict[str, Any]:
+    segments = youtube_evidence_segments(transcript_text)
+    non_intro = [seg for seg in segments if not youtube_intro_or_housekeeping(str(seg.get("text") or ""), int(seg.get("sec") or 0))]
+    chars = len(str(transcript_text or ""))
+    transcript_score = 0
+    if chars >= 12000 and len(segments) >= 120:
+        transcript_score = 8
+    elif chars >= 6000 and len(segments) >= 60:
+        transcript_score = 7
+    elif chars >= 2500 and len(segments) >= 25:
+        transcript_score = 5
+    elif chars >= 800 and len(segments) >= 8:
+        transcript_score = 3
+    elif chars > 0:
+        transcript_score = 2
+    video_score = 0
+    ocr_score = 0
+    # Current baseline does not yet extract frames/OCR. Report it honestly.
+    return {
+        "transcript_score": transcript_score,
+        "video_score": video_score,
+        "image_ocr_score": ocr_score,
+        "transcript_segments": len(segments),
+        "non_intro_segments": len(non_intro),
+        "transcript_chars": chars,
+        "frame_count": 0,
+        "ocr_frame_count": 0,
+    }
+
+# --- URL-run evidence only generation helpers (no broad topic profile/template fallback) ---
+
+def _yt_clean_for_evidence(text: str) -> str:
+    text = clean_youtube_transcript_text(str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _yt_timestamp_seconds(mm: str, ss: str, hh: str = "") -> int:
+    try:
+        if hh:
+            return int(hh) * 3600 + int(mm) * 60 + int(ss)
+        return int(mm) * 60 + int(ss)
+    except Exception:
+        return 0
+
+
+def youtube_evidence_segments(transcript_text: str, max_segments: int = 260) -> list[dict[str, Any]]:
+    """Return timestamped transcript segments from the current URL only.
+
+    This parser intentionally works only on the transcript text passed by the current run.
+    It does not look at previous source packs, old drafts, profiles, or global caches.
+    """
+    src = str(transcript_text or "")
+    pattern = re.compile(r"\[(?:(\d{1,2}):(\d{2}):(\d{2})|(\d{1,2}):(\d{2}))\]\s*([^\[]+)", re.M)
+    out: list[dict[str, Any]] = []
+    for m in pattern.finditer(src):
+        if m.group(1) is not None:
+            sec = _yt_timestamp_seconds(m.group(2), m.group(3), m.group(1))
+        else:
+            sec = _yt_timestamp_seconds(m.group(4), m.group(5))
+        text = _yt_clean_for_evidence(m.group(6))
+        if len(text) < 18:
+            continue
+        out.append({"sec": sec, "time": f"{sec//60:02d}:{sec%60:02d}", "text": text[:520]})
+        if len(out) >= max_segments:
+            break
+    if out:
+        return out
+    # Fallback when timestamps are stripped: use sentences, but keep it current-run only.
+    sentences = split_learning_sentences(src, limit=max_segments)
+    return [{"sec": idx * 30, "time": f"{(idx*30)//60:02d}:{(idx*30)%60:02d}", "text": _yt_clean_for_evidence(sent)} for idx, sent in enumerate(sentences) if len(_yt_clean_for_evidence(sent)) >= 18][:max_segments]
+
+
+def youtube_intro_or_housekeeping(text: str, sec: int = 0) -> bool:
+    lower = str(text or "").lower()
+    intro_patterns = [
+        "welcome", "hello everyone", "hi everyone", "welcome back", "my name is", "today we are",
+        "in this video", "before we jump", "link to", "you will find the link", "course", "free devops course",
+        "subscribe", "like", "comment", "channel", "description below", "join us", "let's get started",
+        "module six", "module 6", "back half", "what we are going to do today",
+    ]
+    if sec < 75 and any(p in lower for p in intro_patterns):
+        return True
+    # Generic logistics lines are not difficult concepts even after the intro.
+    if any(p in lower for p in ["please subscribe", "click the link", "description below", "join the course", "welcome to"]):
+        return True
+    return False
+
+
+def youtube_current_evidence_text(title: str, transcript_text: str) -> str:
+    """Current URL evidence only: title + current URL transcript.
+
+    Do not append previous profiles, old drafts, or source graph nodes from other URLs.
+    """
+    return f"{title}\n{transcript_text}".strip()
+
+
+
+def youtube_evidence_terms(title: str, transcript_text: str, limit: int = 16) -> list[str]:
+    """Strict current-run concept extraction.
+
+    Baseline rule: do not classify the URL by broad keywords.  A concept is
+    accepted only when it is supported by the current title/transcript and passes
+    context gates.  This prevents GitHub→Hub, switching→Switch, OpenRouter→Router,
+    and Kubernetes videos becoming RAG notes.
+    """
+    evidence = youtube_current_evidence_text(title, transcript_text)
+    segments = youtube_evidence_segments(transcript_text)
+    title_terms = yt_title_concepts(title, limit=limit)
+    accepted: list[str] = []
+    rejected: list[tuple[str, str]] = []
+
+    # Conservative alias list.  Aliases are whole-phrase matched; context gates
+    # decide whether ambiguous labels are allowed.
+    aliases: list[tuple[str, list[str]]] = [
+        ("Kubernetes Architecture", ["kubernetes architecture", "k8s architecture"]),
+        ("Kubernetes", ["kubernetes", "k8s"]),
+        ("Control Plane", ["control plane", "master node"]),
+        ("Worker Node", ["worker node", "worker nodes"]),
+        ("API Server", ["api server", "kube-apiserver", "kube api server"]),
+        ("Scheduler", ["scheduler", "kube-scheduler"]),
+        ("Controller Manager", ["controller manager", "kube-controller-manager"]),
+        ("etcd", ["etcd"]),
+        ("kubelet", ["kubelet"]),
+        ("kube-proxy", ["kube-proxy", "kube proxy"]),
+        ("Pod", ["pod", "pods"]),
+        ("Service", ["service", "services"]),
+        ("Deployment", ["deployment", "deployments"]),
+        ("Namespace", ["namespace", "namespaces"]),
+        ("Ingress", ["ingress"]),
+        ("Tools & MCP Servers", ["tools and mcp servers", "tools & mcp servers"]),
+        ("MCP Servers", ["mcp servers", "mcp server", "model context protocol"]),
+        ("Tool Schema", ["tool schema"]),
+        ("Tool Call", ["tool call", "tool calling", "call a tool"]),
+        ("Function Calling", ["function calling", "function call"]),
+        ("Agent Loop", ["agent loop"]),
+        ("Tool", ["tool", "tools"]),
+        ("API", ["api", "apis"]),
+        ("RAG", ["rag", "retrieval augmented generation", "retrieval-augmented generation"]),
+        ("Retrieval", ["retrieval", "retrieve", "retriever"]),
+        ("Evaluation", ["evaluation", "evaluations", "evaluate", "evals"]),
+        ("Vector Databases", ["vector database", "vector databases"]),
+        ("Embedding", ["embedding", "embeddings"]),
+        ("Semantic Search", ["semantic search"]),
+        ("Hybrid Retrieval", ["hybrid retrieval", "hybrid search"]),
+        ("Hub", ["hub", "hubs"]),
+        ("Switch", ["switch", "switches"]),
+        ("Router", ["router", "routers"]),
+        ("MAC Address", ["mac address"]),
+        ("IP Address", ["ip address"]),
+        ("Layer 2", ["layer 2", "layer two", "l2"]),
+        ("Layer 3", ["layer 3", "layer three", "l3"]),
+        ("GitHub Copilot", ["github copilot"]),
+        ("Complex Codebases", ["complex codebases", "complex codebase"]),
+        ("Coding Agents", ["coding agents", "coding agent"]),
+        ("HumanLayer", ["humanlayer", "human layer"]),
+        ("Hermes", ["hermes"]),
+        ("OpenClaw", ["openclaw", "open claw"]),
+        ("OpenRouter", ["openrouter", "open router"]),
+        ("Code Context", ["code context"]),
+        ("Context Compression", ["context compression", "compress it down"]),
+    ]
+
+    # Title concepts are accepted first because they identify the current lecture.
+    for term in title_terms:
+        ok, reason = yt_concept_context_ok(term, evidence, segments)
+        if ok:
+            accepted.append(term)
+        else:
+            rejected.append((term, reason))
+
+    for label, label_aliases in aliases:
+        if label in accepted:
+            continue
+        if not any(yt_phrase_in_text(alias, evidence) for alias in label_aliases):
+            continue
+        ok, reason = yt_concept_context_ok(label, evidence, segments)
+        # Require at least two appearances for ambiguous single-word terms unless in title.
+        if ok and label.lower() in YOUTUBE_AMBIGUOUS_SINGLE_TERMS and not any(yt_phrase_in_text(label, title) for _ in [0]):
+            appearances = sum(yt_phrase_count(alias, evidence) for alias in label_aliases)
+            if appearances < 2 and label not in {"Hermes", "OpenClaw", "OpenRouter"}:
+                ok, reason = False, "ambiguous single-word term appears fewer than 2 times"
+        if ok:
+            accepted.append(label)
+        else:
+            rejected.append((label, reason))
+
+    # Fallback: title concepts only. Never use global topic profiles.
+    if not accepted:
+        accepted = title_terms[:]
+    if not accepted:
+        cleaned_title = re.sub(r"[^A-Za-z0-9가-힣 .+#/-]", " ", str(title or ""))
+        for tok in re.split(r"\s+|[|:,-]", cleaned_title):
+            tok = tok.strip(" _-/|:,.!?()[]{}#")
+            if len(tok) >= 4 and tok.lower() not in YOUTUBE_CONCEPT_STOPWORDS:
+                accepted.append(tok)
+            if len(accepted) >= limit:
+                break
+    return unique_preserve_order(accepted, limit=limit)
+
+
+def youtube_evidence_sections(title: str, transcript_text: str, terms: list[str], limit: int = 5) -> list[dict[str, Any]]:
+    segments = [seg for seg in youtube_evidence_segments(transcript_text) if not youtube_intro_or_housekeeping(seg.get("text", ""), int(seg.get("sec") or 0))]
+    if not segments:
+        segments = youtube_evidence_segments(transcript_text)
+    if not segments:
+        return []
+    chunk_count = max(1, min(limit, len(segments) // 10 + 1))
+    chunk_size = max(5, len(segments) // chunk_count + 1)
+    sections: list[dict[str, Any]] = []
+    for idx in range(0, len(segments), chunk_size):
+        chunk = segments[idx:idx + chunk_size]
+        blob = " ".join(seg.get("text", "") for seg in chunk)
+        local_terms = [term for term in terms if yt_phrase_in_text(term, blob)]
+        if local_terms:
+            stitle = " · ".join(local_terms[:3])
+        else:
+            # Do not invent fake concepts such as '강의 흐름 1'. Use a neutral timestamp label.
+            stitle = f"{chunk[0].get('time','')} 구간"
+        sections.append({"title": stitle, "time": chunk[0].get("time", ""), "sentences": [seg.get("text", "") for seg in chunk[:5]]})
+        if len(sections) >= limit:
+            break
+    return sections
+
+def youtube_evidence_core_problem(title: str, terms: list[str], user_problem: str = "") -> str:
+    problem_note = clean_prompt_memo(user_problem)
+    if problem_note:
+        return problem_note
+    focus = ", ".join(terms[:5]) if terms else "강의에서 실제로 확인된 개념"
+    return f"`{title}` 강의에서 확인된 {focus}의 역할과 연결 흐름을 현재 URL의 대본 근거만으로 설명하는 것"
+
+
+def youtube_evidence_deep_focus(terms: list[str], sections: list[dict[str, Any]]) -> str:
+    if len(terms) >= 3:
+        return f"{terms[0]}, {terms[1]}, {terms[2]}가 어떤 순서와 역할로 연결되는지 설명하는 방법"
+    if terms:
+        return f"{terms[0]}를 이름이 아니라 역할·한계·검증 기준으로 설명하는 방법"
+    if sections:
+        return f"{sections[0].get('title', '첫 번째 강의 흐름')}을 실제 설명 가능한 단위로 정리하는 방법"
+    return "현재 URL에서 확인된 자료만으로 학습 문제를 정리하는 방법"
+
+
+
+def youtube_actual_difficult_points(transcript_text: str, terms: list[str], sections: list[dict[str, Any]], limit: int = 3) -> list[str]:
+    """Return real lecture note checkpoints, not intro lines or filter excuses."""
+    segments = youtube_evidence_segments(transcript_text)
+    scored: list[tuple[int, dict[str, Any], list[str]]] = []
+    explain_markers = [
+        "because", "so", "that's why", "this means", "the reason", "important", "key", "problem", "challenge",
+        "different", "difference", "compare", "architecture", "flow", "how", "when", "why", "actually", "let's look",
+    ]
+    for seg in segments:
+        sec = int(seg.get("sec") or 0)
+        text = str(seg.get("text") or "")
+        if youtube_intro_or_housekeeping(text, sec):
+            continue
+        local_terms = [term for term in terms if yt_phrase_in_text(term, text)]
+        if not local_terms:
+            continue
+        low = text.lower()
+        score = len(local_terms) * 4
+        if any(m in low for m in explain_markers):
+            score += 3
+        # A segment that only says a brand/service once is not a difficult concept.
+        if len(text.split()) < 18:
+            score -= 2
+        if score <= 3:
+            continue
+        scored.append((score, seg, local_terms))
+    scored.sort(key=lambda item: (-item[0], int(item[1].get("sec") or 0)))
+    out: list[str] = []
+    for _score, seg, local_terms in scored[:limit]:
+        concept = ", ".join(local_terms[:3])
+        excerpt = str(seg.get("text") or "")[:220]
+        out.append(f"- [{seg.get('time','')}] **다시 볼 개념: {concept}**\n  - 대본 근거: `{excerpt}`\n  - 강의 노트: 이 구간은 단어를 뽑는 구간이 아니라, 강사가 {concept}을 어떤 상황에서 언급하고 다음 설명으로 어떻게 넘기는지 확인해야 하는 구간이다.")
+    if out:
+        return out
+    # If no robust segment exists, say so. Do not fabricate difficult points.
+    return ["- 현재 대본만으로는 인트로/진행 멘트를 제외한 명확한 어려운 개념 구간을 안정적으로 추출하지 못했다. 이 경우 임의의 어려운 구간을 만들지 않고, 영상 frame/OCR 또는 더 긴 transcript 추출이 필요하다고 표시한다."]
+
+
+def youtube_evidence_problem_steps(terms: list[str], sections: list[dict[str, Any]], title: str) -> list[tuple[str, str, str, str, str]]:
+    """Lecture-note oriented steps from extracted segments.
+
+    This avoids the previous fake action pattern: '역할과 연결 순서로 정리했다'.
+    """
+    steps: list[tuple[str, str, str, str, str]] = []
+    use_sections = sections[:3]
+    if not use_sections and terms:
+        use_sections = [{"title": term, "sentences": []} for term in terms[:3]]
+    for sec in use_sections:
+        stitle = str(sec.get("title") or "강의 구간")
+        sents = [str(x).strip() for x in sec.get("sentences") or [] if str(x).strip()]
+        evidence = " ".join(sents[:2]).strip()
+        if not evidence:
+            evidence = stitle
+        problem = f"이 구간에서 확인할 내용은 `{stitle}`이다. 단어 자체보다, 강사가 이 표현을 어떤 설명 흐름에서 사용했는지가 중요하다."
+        cause = f"대본 근거: `{evidence[:260]}`"
+        action = "강의 노트: 이 구간의 문장을 그대로 외우는 것이 아니라, 앞뒤 문맥에서 어떤 비교·예시·전환이 일어나는지 표시해야 한다. 현재 추출 단계에서는 이 문맥을 그대로 보존하고, 다른 영상에서 온 개념으로 보충하지 않는다."
+        validation = f"추출 검증 기준: `{stitle}`이 현재 URL의 대본에 실제로 나타나며, GitHub→Hub 같은 부분 문자열 오탐이나 이전 글의 개념으로 만들어진 항목이 아니어야 한다."
+        steps.append((stitle, problem, cause, action, validation))
+    return steps[:3]
+
+
+def youtube_evidence_concept_notes(terms: list[str], transcript_text: str) -> list[str]:
+    out: list[str] = []
+    segments = youtube_evidence_segments(transcript_text, max_segments=160)
+    for term in terms[:10]:
+        evidence_line = ""
+        evidence_time = ""
+        for seg in segments:
+            if youtube_intro_or_housekeeping(str(seg.get("text") or ""), int(seg.get("sec") or 0)):
+                continue
+            if yt_phrase_in_text(term, str(seg.get("text") or "")):
+                evidence_line = str(seg.get("text") or "")[:220]
+                evidence_time = str(seg.get("time") or "")
+                break
+        if evidence_line:
+            out.append(f"- **{term}**: [{evidence_time}] `{evidence_line}`")
+        else:
+            out.append(f"- **{term}**: 현재 URL 제목에서 확인된 개념이다. 대본 안의 설명 근거가 부족하면 별도 정의로 확장하지 않는다.")
+    return out
+
+def youtube_evidence_portfolio_skills(terms: list[str]) -> str:
+    rows = [
+        "- Treating each URL as a separate learning source",
+        "- Extracting concepts only from current transcript evidence",
+        "- Separating lecture flow into problem, action, and validation",
+        "- Avoiding unsupported explanations beyond the current lecture evidence",
+        "- Explaining concepts by role, limitation, and verification criteria",
+    ]
+    for term in terms[:5]:
+        rows.append(f"- Explaining {term} from current lecture evidence")
+    return "\n".join(rows[:10])
+
+
+
+def youtube_current_run_quality_note(transcript_text: str, collector_report: dict[str, Any]) -> str:
+    report = yt_extraction_report(str(collector_report.get("title") or ""), transcript_text)
+    return (
+        f"대본 {report['transcript_score']}/10, 영상 {report['video_score']}/10, 이미지/OCR {report['image_ocr_score']}/10 "
+        f"(자막 세그먼트 {report['transcript_segments']}, 글자 수 {report['transcript_chars']}, "
+        f"frame {report['frame_count']}, OCR frame {report['ocr_frame_count']}). "
+        "현재 베이스라인은 대본 중심 추출이며, frame/OCR은 아직 0점으로 보고한다."
+    )
+
 def build_youtube_problem_medium_draft(
     seed_url: str,
     run_id: str,
@@ -2649,8 +4056,11 @@ def build_youtube_problem_medium_draft(
 ) -> str:
     graph = collector_source_graph(collector_report, max_nodes=160)
     payload = load_collector_json(collector_report)
-    title = str(graph.get("title") or "YouTube 강의").strip()
+    title = str(youtube_title_from_source_pack(source_pack_text) or graph.get("title") or "YouTube 강의").strip()
     transcript_text = youtube_transcript_text(payload, graph)
+    pack_transcript_text = youtube_transcript_text_from_source_pack(source_pack_text, seed_url)
+    if len(pack_transcript_text) > len(transcript_text):
+        transcript_text = pack_transcript_text
     terms = youtube_learning_terms(title, transcript_text, limit=18)
     sections = youtube_keyword_sections(title, transcript_text, limit=6) or youtube_chapter_sections(transcript_text, limit=6, title=title)
     core_problem = youtube_core_problem_from_profile(title, terms, user_problem, transcript_text)
@@ -2659,8 +4069,11 @@ def build_youtube_problem_medium_draft(
     quality = (collector_report.get("quality") if isinstance(collector_report.get("quality"), dict) else {}) or {}
     transcript_segments = int(quality.get("transcript_segments") or 0)
     key_terms = terms[:8] or [s.get("title", "핵심 개념") for s in sections[:5]] or ["핵심 개념"]
+    deep_focus = youtube_deep_focus(title, terms, transcript_text)
+    emphasis_moments = youtube_emphasis_moments(transcript_text, limit=5)
+    emphasis_md = "\n".join(f"- {item}" for item in emphasis_moments) if emphasis_moments else "- 강사가 명시적으로 멈춰 보라고 말한 구간은 자막에서 안정적으로 분리되지 않았다. 대신 핵심 개념의 처리 순서와 검증 질문을 기준으로 학습 흐름을 잡았다."
     step_md = "\n".join(
-        f"### {idx}. {step_title}\n문제: {problem}\n\n원인 판단: {cause}\n\n조치: {action}\n\n확인 결과: {validation}\n"
+        f"### {idx}. {step_title}\n문제: {problem}\n\n접근 방법: {cause}\n\n조치: {action}\n\n확인 결과: {validation}\n"
         for idx, (step_title, problem, cause, action, validation) in enumerate(steps, start=1)
     )
     concept_md = "\n".join(concept_notes) if concept_notes else "- 자막에서 신뢰할 수 있는 핵심 개념을 충분히 분리하지 못했다."
@@ -2686,9 +4099,10 @@ _A learner-centered Medium portfolio note on technical concept understanding_
 - 학습 자료: YouTube 강의 `{title}`
 - 참고 URL: {seed_url}
 - 핵심 문제: {core_problem}
+- 깊게 푼 개념: {deep_focus}
 - 핵심 키워드: {', '.join(key_terms)}
-- 학습 초점: 개념 정의, 적용 조건, 비용/역할 차이, 이해 검증 기준을 분리해서 정리
-- 결과: 강의 주제를 실제 문제 상황에서 설명할 수 있는 학습 기준으로 정리
+- 학습 초점: 개념을 왜 알아야 하는지가 아니라, 실제로 어떤 순서로 적용하고 무엇으로 검증하는지 정리
+- 결과: 강의 주제를 처리 절차, 판단 기준, 확인 질문까지 설명할 수 있는 학습 기록으로 정리
 
 ## 문제 인식
 {problem_awareness_md}
@@ -2698,6 +4112,9 @@ _A learner-centered Medium portfolio note on technical concept understanding_
 
 ## 왜 이것을 문제로 인식했는가
 {why_problem_md}
+
+## 강사가 강조한 어려운 구간 / 다시 확인할 지점
+{emphasis_md}
 
 ## 문제 해결 경험
 {step_md}
@@ -2925,7 +4342,7 @@ def split_learning_sentences(text: str, limit: int = 80) -> list[str]:
         if len(sentence) < 35 or len(sentence) > 420:
             continue
         lower = sentence.lower()
-        if any(skip in lower for skip in ["source pack", "collection metadata", "transcript collected", "youtube video", "input url"]):
+        if any(skip in lower for skip in ["수집 자료", "collection metadata", "transcript collected", "youtube video", "input url"]):
             continue
         if sentence not in sentences:
             sentences.append(sentence)
@@ -3482,7 +4899,7 @@ _A problem-solving Medium portfolio note from a learner's technical study_
 {learner_why}
 
 ## 문제 해결 경험
-{chr(10).join(f"### {i}. {title}{chr(10)}문제: {problem}{chr(10)}{chr(10)}원인 판단: 강의 내용에서 이 항목이 독립된 설명으로 끝나는 것이 아니라 앞뒤 개념과 실습 확인 단계에 연결되어 있음을 확인했다.{chr(10)}{chr(10)}조치: {action}{chr(10)}{chr(10)}확인 결과: {validation}{chr(10)}" for i, (title, problem, action, validation) in enumerate(step_sections, start=1))}
+{chr(10).join(f"### {i}. {title}{chr(10)}문제: {problem}{chr(10)}{chr(10)}접근 방법: 강의 내용에서 이 항목이 독립된 설명으로 끝나는 것이 아니라 앞뒤 개념과 실습 확인 단계에 연결되어 있음을 확인했다.{chr(10)}{chr(10)}조치: {action}{chr(10)}{chr(10)}확인 결과: {validation}{chr(10)}" for i, (title, problem, action, validation) in enumerate(step_sections, start=1))}
 
 ## 복잡한 문제 해결 경험
 {complex_detail_md}
@@ -3497,7 +4914,7 @@ _A problem-solving Medium portfolio note from a learner's technical study_
 {concept_md}
 
 ## 사용한 주요 수식/코드 정리
-이번 source pack에서 Medium 글에 그대로 인용할 수 있는 수식 또는 코드 원문은 명확하게 제공되지 않았다. 따라서 임의의 코드나 수식을 만들지 않고, 강의에서 확인된 개념·도구·실습 단계의 역할만 문제 해결 흐름 안에서 해석했다.
+이번 강의/실습에서 Medium 글에 그대로 인용할 수 있는 수식 또는 코드 원문은 명확하게 제공되지 않았다. 따라서 임의의 코드나 수식을 만들지 않고, 강의에서 확인된 개념·도구·실습 단계의 역할만 문제 해결 흐름 안에서 해석했다.
 
 코드나 수식이 포함된 Lab 원문이 제공되는 경우에는 다음 기준으로 정리한다.
 
@@ -4996,7 +6413,7 @@ def build_text_assisted_solution_steps(article_type: str, raw_text: str, memo: s
                 "step": 3,
                 "title": "스택까지의 학습 범위 재구성",
                 "problem": "목차를 따라 읽으면 학습 범위는 늘어나지만, 지금 어디까지 문제 풀이 기준으로 정리했는지 흐려질 수 있었다.",
-                "cause": "현재 자료 제목에 '~179 스택까지'가 포함되어 있어, 스택 이전 개념과 스택 개념을 하나의 학습 단위로 구분해야 했다.",
+                "cause": "강의 자료 제목에 '~179 스택까지'가 포함되어 있어, 스택 이전 개념과 스택 개념을 하나의 학습 단위로 구분해야 했다.",
                 "action": "파이썬 기본 문법부터 스택까지를 코딩테스트 초반 문제 풀이에 필요한 최소 단위로 묶어 정리했다.",
                 "verification": "스택까지의 학습 범위를 다음 복습/문제 풀이 계획으로 연결할 수 있는지 확인한다.",
                 "technical_entities": ["파이썬 문법", "스택", "PCCE", "PCCP", "문제 풀이 루틴"],
@@ -5215,7 +6632,7 @@ def build_text_assisted_solution_steps(article_type: str, raw_text: str, memo: s
             "step": idx,
             "title": step["title"],
             "problem": step["problem"],
-            "cause": "현재 source pack 안의 제목, URL, 반복 용어만으로 학습 흐름을 재구성해야 한다.",
+            "cause": "강의에서 확인한 제목, URL, 반복 용어만으로 학습 흐름을 재구성해야 한다.",
             "action": step["action"],
             "verification": step["verification"],
             "technical_entities": source_derived_terms(raw_text, memo, limit=5),
@@ -5512,7 +6929,7 @@ def is_default_no_problem_memo(memo: str) -> bool:
         "없음",
         "자료의 핵심 흐름",
         "핵심 내용을 중심으로",
-        "현재 자료",
+        "강의 자료",
         "작성하겠습니다",
         "작성해주세요",
         "어려웠던 점",
@@ -5761,22 +7178,22 @@ def source_derived_generic_steps(raw_text: str, memo: str) -> list[dict[str, str
     secondary = terms[1] if len(terms) > 1 else "실습 단계"
     return [
         {
-            "title": "자료를 적용 기준으로 재구성",
-            "problem": "자료의 내용을 그대로 읽는 것만으로는 실제 문제 풀이, 실습 수행, 면접 설명에서 어떤 기준으로 활용해야 하는지 분명하지 않았다.",
-            "action": "현재 source pack에 실제로 등장한 제목, URL, 단계명, 반복 용어를 바탕으로 개념을 적용 상황과 확인 기준 중심으로 다시 나누었다.",
+            "title": "핵심 개념을 실제 적용 순서로 풀기",
+            "problem": "처음에는 개념 설명과 실습 단계가 함께 제시되어 어떤 순서로 이해하고 적용해야 하는지 분명하지 않았다.",
+            "action": "강의에서 확인한 제목, 단계명, 도구 이름, 반복 개념을 바탕으로 실제 학습 순서와 확인 기준을 다시 나누었다.",
             "verification": "정리한 내용이 자료 소개가 아니라 '어떤 상황에서 어떤 개념을 쓰는가'로 설명되는지 확인했다.",
         },
         {
             "title": "핵심 개념과 혼동 지점 분리",
             "problem": "개념 설명, 실습 지시, 도구 실행 단계가 한 화면 안에 섞이면 무엇을 먼저 이해해야 하는지 흐려질 수 있었다.",
-            "action": f"{', '.join(terms[:4])} 같은 현재 자료의 단서를 기준으로 핵심 개념, 적용 조건, 확인해야 할 지점을 분리했다.",
+            "action": f"{', '.join(terms[:4])} 같은 강의 자료의 단서를 기준으로 핵심 개념, 적용 조건, 확인해야 할 지점을 분리했다.",
             "verification": "각 용어를 단순 정의가 아니라 학습/실습에서 맡는 역할로 설명할 수 있는지 확인했다.",
         },
         {
             "title": "다음 학습과 검증 기준 연결",
             "problem": "마지막에 무엇을 할 수 있어야 성공인지 모호하면 학습 기록이 단순 요약으로 끝날 수 있었다.",
-            "action": "자료에 남은 개념, 예제, 실습 단서를 다음 복습/문제 풀이/실행 확인 기준으로 재배치했다.",
-            "verification": "없는 성공 화면이나 다른 강의의 절차를 섞지 않고, 현재 source pack에서 뒷받침되는 기준만 남겼다.",
+            "action": "강의에서 확인한 개념, 예제, 실습 단서를 다음 복습/문제 풀이/실행 확인 기준으로 재배치했다.",
+            "verification": "실제로 확인한 개념과 단계만 기준으로 다음 학습과 검증 기준을 남겼다.",
         },
     ]
 
@@ -5792,7 +7209,7 @@ def microsoft_foundry_first_agent_steps() -> list[dict[str, str]]:
         {
             "title": "첫 Agent 생성 단계 이해",
             "problem": "agent 생성 화면이 단순 템플릿 선택인지, 실제 동작할 agent 구성을 만드는 단계인지 헷갈릴 수 있었다.",
-            "action": "first agent 생성 단계에서 이름, 지시문, 연결된 리소스, 기본 실행 설정이 어떤 역할을 하는지 현재 자료의 순서대로 정리했다.",
+            "action": "first agent 생성 단계에서 이름, 지시문, 연결된 리소스, 기본 실행 설정이 어떤 역할을 하는지 강의 자료의 순서대로 정리했다.",
             "verification": "생성된 agent가 어떤 입력을 받고 어떤 방식으로 응답해야 하는지 설명할 수 있는지 확인했다.",
         },
         {
@@ -6034,7 +7451,7 @@ def build_url_assisted_medium_draft(
         subtitle = "Clarifying concept boundaries, lab flow, tool roles, and validation criteria"
         core_problem = f"{compact_user_intent(raw_text, memo)}이 핵심 문제였다."
         key_terms = normalize_str_list(problem_map.get("key_terms")) or derived_terms
-        final_result = "현재 source pack에 있는 단서만 사용해 개념 경계, 실습 순서, 파일/도구 역할, 확인 기준을 분리했다."
+        final_result = "강의에서 확인한 단서만 사용해 개념 경계, 실습 순서, 파일/도구 역할, 확인 기준을 분리했다."
         skills = ["Clarifying concept boundaries", "Reconstructing lab flow from source text", "Separating tool roles and validation criteria"]
 
     urls = extract_urls_from_text(source)
@@ -6064,7 +7481,7 @@ def build_url_assisted_medium_draft(
     elif github:
         lines.append("이번 학습은 GitHub Agentic Workflows에서 `workflow_dispatch`가 자동화 실행 조건으로 어떤 의미를 갖는지 이해하는 데서 출발했다. workflow 파일이 실행 조건을 정의하고, activation 이후 변경사항이 Pull Request 검토 흐름으로 이어질 수 있다는 점을 중심으로 GitHub 기반 자동화 구조를 살펴보았다.")
     else:
-        lines.append("이번 학습은 강의 자료와 실습 단서에 남아 있는 핵심 개념과 작업 흐름을 이해하는 데서 출발했다. 자료에 남은 제목, 용어, 단계 정보를 바탕으로 학습 목표와 개념 간 관계를 정리했다.")
+        lines.append("이번 학습은 강의에서 제시된 핵심 개념과 실습 흐름을 실제로 따라갈 수 있는 순서로 이해하는 데서 출발했다. 제목, 용어, 단계 정보를 단순히 읽는 것이 아니라 먼저 무엇을 확인하고 다음에 어떤 조치를 해야 하는지 중심으로 정리했다.")
     lines.append("")
     lines.append("## 핵심 작업 요약")
     lines.append(f"- 핵심 문제: {core_problem}")
@@ -6113,7 +7530,7 @@ def build_url_assisted_medium_draft(
         lines.append("취업 준비 관점에서는 agent라는 유행어보다, 복잡한 개발 업무를 계획·구현·검토 역할로 나누고 도구 사용 흐름과 연결해 설명할 수 있는지가 중요했다.")
     else:
         lines.append(f"처음 헷갈린 지점은 {core_problem}")
-        lines.append("핵심은 현재 자료에 있는 용어만 기준으로 개념 경계, lab flow, 파일/도구 역할, validation criteria를 분리하는 것이었다.")
+        lines.append("핵심은 강의에서 확인한 용어와 단계만 기준으로 개념 경계, lab flow, 파일/도구 역할, validation criteria를 분리하는 것이었다.")
     lines.append("")
     lines.append("## 문제 정의")
     lines.append(core_problem)
@@ -6155,7 +7572,7 @@ def build_url_assisted_medium_draft(
     elif agent_orch:
         lines.append("실무형 AI 활용은 하나의 답변을 잘 받는 것에서 끝나지 않는다. 복잡한 작업을 계획, 구현, 검토 단위로 쪼개고 각 역할에 맞는 agent와 toolchain을 배치할 수 있어야 개발 workflow로 확장된다.")
     else:
-        lines.append("학습자가 막히는 지점은 대개 용어 자체보다 개념 경계, 실습 순서, 파일/도구 역할, 검증 기준이 한 번에 섞이는 데서 나온다. 그래서 현재 자료에서 확인되는 단서만으로 무엇을 했고 무엇을 확인해야 하는지 분리했다.")
+        lines.append("학습자가 막히는 지점은 대개 용어 자체보다 개념 경계, 실습 순서, 파일/도구 역할, 검증 기준이 한 번에 섞이는 데서 나온다. 그래서 강의에서 확인한 단서를 기준으로 무엇을 했고 무엇을 확인해야 하는지 분리했다.")
     lines.append("")
     lines.append("## 문제 해결 경험")
     if not steps:
@@ -6188,7 +7605,7 @@ def build_url_assisted_medium_draft(
     lines.append("## 성과")
     lines.append(final_result)
     lines.append("")
-    lines.append("확인되지 않은 성공 결과를 임의로 넣기보다, 현재 자료에서 설명 가능한 개념·흐름·확인 기준을 중심으로 정리했다.")
+    lines.append("실제로 확인한 단계와 개념을 기준으로 성과를 정리하고, 확인하지 않은 성공 화면이나 결과는 과장하지 않았다.")
     lines.append("")
     lines.append("## 사용한 주요 개념 정리")
     if wikidocs_coding:
@@ -8074,7 +9491,7 @@ def structured_section(
                 f"### {step.get('step')}. {step.get('title')}\n"
                 f"{image_ref_text}\n\n"
                 f"문제/제약: {step.get('problem')}\n\n"
-                f"원인 판단: {step.get('cause')}\n\n"
+                f"접근 방법: {step.get('cause')}\n\n"
                 f"조치: {step.get('action')}{detail_text}\n\n"
                 f"확인 결과: {step.get('verification')}"
                 f"{portfolio_meaning_text(step)}"
@@ -8983,7 +10400,7 @@ def fallback_section(
             lines.append(
                 f"### {step['step']}. {step['title']}\n"
                 f"문제/제약: {step['problem']}\n\n"
-                f"원인 판단: {step['cause']}\n\n"
+                f"접근 방법: {step['cause']}\n\n"
                 f"조치: {step['action']}\n\n"
                 f"확인 결과: {step['verification']}"
             )
@@ -8995,8 +10412,36 @@ def sanitize_medium_markdown(article: str) -> str:
     cleaned = article
     for phrase in PLACEHOLDER_PHRASES:
         cleaned = cleaned.replace(phrase, "")
+    cleaned = strip_generation_meta_voice(cleaned)
     return postprocess_article_text(cleaned).strip()
 
+
+def strip_generation_meta_voice(article: str) -> str:
+    """Remove app/AI/collector perspective from user-facing Medium drafts."""
+    banned_line_patterns = [
+        r"source\s*pack", r"source_graph", r"SOURCE_GRAPH", r"run_id", r"collector", r"수집기",
+        r"자막을.*글", r"글로\s*바꾸", r"글로\s*옮기", r"이번\s*글은", r"본문은",
+        r"포트폴리오\s*글은\s*요약문", r"영상\s*기반\s*학습", r"AI가", r"앱이", r"생성기",
+        r"현재\s*자료", r"자료에\s*남은", r"확인되지 않은 성공 결과",
+    ]
+    kept: list[str] = []
+    for line in (article or "").splitlines():
+        stripped = line.strip()
+        if stripped and any(re.search(pat, stripped, flags=re.I) for pat in banned_line_patterns):
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept)
+    replacements = {
+        "source pack": "강의 자료",
+        "Source pack": "강의 자료",
+        "현재 자료": "강의에서 확인한 내용",
+        "자료에 남은": "강의에서 확인한",
+        "이번 글의 핵심": "이번 학습의 핵심",
+        "이번 글은": "이번 학습은",
+    }
+    for a, b in replacements.items():
+        cleaned = cleaned.replace(a, b)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 def postprocess_article_text(article: str) -> str:
     cleaned = article
@@ -10029,6 +11474,272 @@ def make_note(raw_text: str, memo: str, image_path: str | None, image_paths: lis
     )
 
 
+# --- YouTube multimodal extraction gate integration ---
+def _scc_json_load(path: Path, fallback: Any) -> Any:
+    try:
+        if Path(path).exists():
+            return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return fallback
+    return fallback
+
+
+def _scc_mmss(seconds: Any) -> str:
+    try:
+        sec = int(float(seconds or 0))
+    except Exception:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _scc_extractor_transcript_text(run_dir: Path, limit_chars: int = 90000) -> str:
+    rows = _scc_json_load(run_dir / "transcript.json", [])
+    out: list[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        txt = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if not txt:
+            continue
+        out.append(f"[{_scc_mmss(item.get('start'))}] {txt}")
+    return "\n".join(out)[:limit_chars]
+
+
+def _scc_extractor_timeline_text(run_dir: Path, limit: int = 30) -> str:
+    rows = _scc_json_load(run_dir / "timeline.json", [])
+    out: list[str] = []
+    for item in rows[:limit]:
+        if not isinstance(item, dict):
+            continue
+        st = _scc_mmss(item.get("start"))
+        role = str(item.get("segment_role") or "segment")
+        transcript = re.sub(r"\s+", " ", str(item.get("transcript") or "")).strip()[:420]
+        concepts = []
+        for c in item.get("candidate_concepts") or []:
+            if isinstance(c, dict) and c.get("text"):
+                concepts.append(str(c.get("text")))
+        concept_text = ", ".join(concepts[:8])
+        out.append(f"- [{st}] {role}" + (f" | concepts: {concept_text}" if concept_text else "") + (f"\n  {transcript}" if transcript else ""))
+    return "\n".join(out)
+
+
+def _scc_extractor_concepts_text(run_dir: Path, limit: int = 60) -> str:
+    data = _scc_json_load(run_dir / "concepts.json", {"accepted": [], "rejected_false_positives": []})
+    accepted = data.get("accepted") if isinstance(data, dict) else []
+    rejected = data.get("rejected_false_positives") if isinstance(data, dict) else []
+    rows = ["## Accepted Concepts"]
+    for c in (accepted or [])[:limit]:
+        if not isinstance(c, dict):
+            continue
+        rows.append(f"- {c.get('text')} | evidence={c.get('evidence')} | confidence={c.get('confidence')} | timestamps={c.get('timestamps')}")
+    rows.append("")
+    rows.append("## Rejected False Positives")
+    for c in (rejected or [])[:40]:
+        if not isinstance(c, dict):
+            continue
+        rows.append(f"- {c.get('text')} | reason={c.get('reason')}")
+    return "\n".join(rows)
+
+
+
+def _scc_find_cached_extraction_run(seed_url: str) -> Path | None:
+    runs_root = BASE_DIR / "runs"
+    if not runs_root.exists():
+        return None
+    candidates = sorted(runs_root.glob("run_*"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for run_dir in candidates:
+        report_path = run_dir / "extraction_report.json"
+        transcript_path = run_dir / "transcript.json"
+        if not report_path.exists() or not transcript_path.exists():
+            continue
+        report = _scc_json_load(report_path, {})
+        if not isinstance(report, dict):
+            continue
+        same_url = str(report.get("input_url") or "").strip() == str(seed_url).strip()
+        can_generate = report.get("can_generate_draft") is True
+        transcript_rows = _scc_json_load(transcript_path, [])
+        has_transcript = isinstance(transcript_rows, list) and len(transcript_rows) > 0
+        if same_url and can_generate and has_transcript:
+            return run_dir
+    return None
+
+def run_youtube_extraction_gate(seed_url: str, run_id: str) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    try:
+        from tools.run_extraction_pipeline import run_extraction
+    except Exception as exc:
+        return "", {
+            "ok": False,
+            "collector": "youtube_extraction_gate",
+            "error": f"run_extraction import failed: {type(exc).__name__}: {exc}",
+            "seed_url": seed_url,
+            "run_id": run_id,
+        }
+
+    skip_ocr = str(os.getenv("SCC_SKIP_OCR", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    whisper_model = os.getenv("SCC_WHISPER_MODEL", "base")
+    cached_run_dir = _scc_find_cached_extraction_run(seed_url)
+    if cached_run_dir is not None:
+        result = {
+            "run_id": cached_run_dir.name,
+            "run_dir": str(cached_run_dir),
+            "cache_hit": True,
+        }
+    else:
+        try:
+            result = run_extraction(
+                input_url=seed_url,
+                runs_root=BASE_DIR / "runs",
+                run_id=run_id,
+                whisper_model=whisper_model,
+                skip_ocr=skip_ocr,
+            )
+        except Exception as exc:
+            return "", {
+                "ok": False,
+                "collector": "youtube_extraction_gate",
+                "error": f"run_extraction failed: {type(exc).__name__}: {exc}",
+                "seed_url": seed_url,
+                "run_id": run_id,
+                "elapsed_seconds": round(time.perf_counter() - started, 2),
+            }
+
+    run_dir = Path(str(result.get("run_dir") or BASE_DIR / "runs" / run_id))
+    report = _scc_json_load(run_dir / "extraction_report.json", {})
+    transcript_text = _scc_extractor_transcript_text(run_dir)
+    timeline_text = _scc_extractor_timeline_text(run_dir)
+    concepts_text = _scc_extractor_concepts_text(run_dir)
+    frames = _scc_json_load(run_dir / "frames.json", [])
+    ocr = _scc_json_load(run_dir / "ocr.json", [])
+
+    title = str(report.get("title") or "YouTube 강의")
+    video_id = str(report.get("video_id") or youtube_video_id(seed_url) or "")
+    assets = report.get("assets") if isinstance(report.get("assets"), dict) else {}
+    scores = report.get("scores") if isinstance(report.get("scores"), dict) else {}
+    warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
+
+    output_dir = DATA_DIR / "source_packs" / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    md_path = output_dir / "source_pack.md"
+    json_path = output_dir / "collector_payload.json"
+
+    warnings_text = "\n".join("- " + str(w) for w in warnings[:20]) if warnings else "- 없음"
+    source_pack = f"""# YouTube Extraction Source Pack
+
+[수집 방식]
+youtube_extraction_gate
+
+[요청 URL]
+{seed_url}
+
+[video_id]
+{video_id}
+
+[영상 제목]
+{title}
+
+[Extraction Scores]
+{json.dumps(scores, ensure_ascii=False, indent=2)}
+
+[Extraction Assets]
+{json.dumps(assets, ensure_ascii=False, indent=2)}
+
+[영상 자막]
+{transcript_text or "영상 자막 없음"}
+
+[Lecture Timeline]
+{timeline_text or "timeline 없음"}
+
+[Concept Provenance]
+{concepts_text}
+
+[Warnings]
+{warnings_text}
+"""
+    md_path.write_text(source_pack, encoding="utf-8")
+
+    transcript_chars = len(transcript_text)
+    frame_count = len(frames) if isinstance(frames, list) else int(assets.get("frames_extracted") or 0)
+    ocr_count = len(ocr) if isinstance(ocr, list) else int(assets.get("ocr_frames") or 0)
+    timeline_segments = int(assets.get("timeline_segments") or 0)
+    can_generate = bool(report.get("can_generate_draft"))
+
+    payload = {
+        "title": title,
+        "input_url": seed_url,
+        "current_url": seed_url,
+        "video_id": video_id,
+        "stats": {
+            "page_count": 1,
+            "visible_text_chars": len(source_pack),
+            "video_candidate_count": 1,
+            "frame_count": frame_count,
+            "ocr_frame_count": ocr_count,
+        },
+        "quality": {
+            "quality_status": "pass" if can_generate else "fail",
+            "can_generate_article": can_generate,
+            "transcript_chars": transcript_chars,
+            "transcript_segments": int(assets.get("transcript_segments") or len(re.findall(r"^\[\d", transcript_text, flags=re.M))),
+            "frame_count": frame_count,
+            "ocr_frame_count": ocr_count,
+            "timeline_segments": timeline_segments,
+            "usable_text_chars": len(source_pack),
+            "warnings": warnings,
+            "scores": scores,
+        },
+        "nodes": [
+            {
+                "order": 1,
+                "type": "video",
+                "title": title,
+                "url": seed_url,
+                "text_chars": len(source_pack),
+                "text": source_pack[:16000],
+                "headings": ["영상 자막", "Lecture Timeline", "Concept Provenance"],
+            }
+        ],
+        "video_url_candidates": [seed_url],
+        "extraction_report": report,
+        "run_dir": str(run_dir),
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    collector_report = {
+        "ok": can_generate,
+        "collector": "youtube_extraction_gate",
+        "run_id": run_id,
+        "seed_url": seed_url,
+        "title": title,
+        "json_path": str(json_path),
+        "markdown_path": str(md_path),
+        "run_dir": str(run_dir),
+        "extraction_report_path": str(run_dir / "extraction_report.json"),
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "stats": payload["stats"],
+        "quality": payload["quality"],
+        "extraction_report": report,
+        "cache_hit": bool(result.get("cache_hit")),
+        "source_graph": {
+            "title": title,
+            "current_url": seed_url,
+            "stats": payload["stats"],
+            "quality": payload["quality"],
+            "nodes": payload["nodes"],
+            "video_url_candidates": [seed_url],
+        },
+    }
+    if not source_pack.strip() or transcript_chars < 1:
+        collector_report["ok"] = False
+        collector_report["error"] = "youtube extraction produced no transcript text"
+    return source_pack, collector_report
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -10263,7 +11974,7 @@ class Handler(BaseHTTPRequestHandler):
                         },
                         "critic_report": {
                             "passed": False,
-                            "failures": ["Inflearn requires transcript/curriculum/source pack or logged-in assisted capture."],
+                            "failures": ["Inflearn requires transcript/curriculum/수집 자료 or logged-in assisted capture."],
                             "metrics": {"unsupported_url": seed_url, "run_id": url_run_id},
                         },
                         "elapsed_seconds": 0,
@@ -10290,7 +12001,7 @@ class Handler(BaseHTTPRequestHandler):
                         },
                         "critic_report": {
                             "passed": False,
-                            "failures": ["Udemy requires manual source pack collection."],
+                            "failures": ["Udemy requires manual 수집 자료 collection."],
                             "metrics": {"unsupported_url": seed_url, "run_id": url_run_id},
                         },
                         "elapsed_seconds": 0,
@@ -10298,7 +12009,10 @@ class Handler(BaseHTTPRequestHandler):
                         "mode": "manual_source_pack_required",
                     }
                 )
-            source_pack_text, collector_report = run_source_pack_collector(seed_url, run_id=url_run_id)
+            if urls and is_youtube_host(seed_url):
+                source_pack_text, collector_report = run_youtube_extraction_gate(seed_url, url_run_id)
+            else:
+                source_pack_text, collector_report = run_source_pack_collector(seed_url, run_id=url_run_id)
             collector_report = dict(collector_report or {})
             collector_report["run_id"] = url_run_id
             collector_report["seed_url"] = seed_url
@@ -10339,6 +12053,24 @@ class Handler(BaseHTTPRequestHandler):
                         "image_count": len(image_files),
                         "mode": "source_graph_collection_insufficient",
                     })
+                if collector_report.get("collector") == "youtube_extraction_gate":
+                    summary = build_youtube_gate_current_run_summary(seed_url, url_run_id, source_pack_text, collector_report, memo)
+                    return self.json({
+                        "draft": summary,
+                        "article_type": "youtube_gate_current_run_summary",
+                        "image_evidence": [],
+                        "learning_evidence": [],
+                        "problem_map": {"collector_report": collector_report, "seed_url": seed_url, "run_id": url_run_id},
+                        "decision_map": {},
+                        "section_plan": [],
+                        "article_brief": {"source": "youtube_gate_current_run", "seed_url": seed_url, "run_id": url_run_id},
+                        "collector_report": collector_report,
+                        "critic_report": {"passed": True, "failures": [], "metrics": {"run_id": url_run_id, "seed_url": seed_url}},
+                        "elapsed_seconds": collector_report.get("elapsed_seconds", 0),
+                        "image_count": len(image_files),
+                        "mode": "youtube_gate_current_run_summary",
+                    })
+
                 if format_type == "lecture-summary":
                     summary = build_lecture_content_summary(seed_url, url_run_id, source_pack_text, collector_report, memo)
                     return self.json({
@@ -10436,7 +12168,7 @@ class Handler(BaseHTTPRequestHandler):
                         "collector_report": collector_report,
                         "critic_report": {
                             "passed": False,
-                            "failures": ["source pack collection failed or produced no usable public text"],
+                            "failures": ["수집 자료 collection failed or produced no usable public text"],
                             "metrics": collector_report,
                         },
                         "elapsed_seconds": collector_report.get("elapsed_seconds", 0),
@@ -10486,12 +12218,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"ok": False, "error": "url is required"})
         run_id = str(data.get("run_id") or make_generation_run_id())
         timeout_seconds = int(data.get("timeout_seconds") or 600)
-        source_pack_text, collector_report = run_source_pack_collector(seed_url, timeout_seconds=timeout_seconds, run_id=run_id)
+        if is_youtube_host(seed_url):
+            source_pack_text, collector_report = run_youtube_extraction_gate(seed_url, run_id)
+        else:
+            source_pack_text, collector_report = run_source_pack_collector(seed_url, timeout_seconds=timeout_seconds, run_id=run_id)
         collector_report = dict(collector_report or {})
         collector_report["run_id"] = run_id
         collector_report["seed_url"] = seed_url
         collector_report["source_graph"] = collector_source_graph(collector_report)
-        sufficient, reasons = source_pack_quality_sufficient(seed_url, source_pack_text, collector_report) if source_pack_text.strip() else (False, ["empty source pack"])
+        sufficient, reasons = source_pack_quality_sufficient(seed_url, source_pack_text, collector_report) if source_pack_text.strip() else (False, ["empty 수집 자료"])
         return self.json({
             "ok": bool(source_pack_text.strip()) and bool(collector_report.get("ok")) and sufficient,
             "source_pack_chars": len(source_pack_text or ""),
@@ -10972,6 +12707,7 @@ function renderDebug(payload) {
     const tabs = [
     ["Final Article", lastDebug.draft || result.textContent],
     ["Collector Report", lastDebug.collector_report || {}],
+    ["Extraction Report", (lastDebug.collector_report && lastDebug.collector_report.extraction_report) || {}],
     ["Capture Timeline", lastDebug["Capture Timeline"] || lastDebug.capture_timeline || []],
     ["Q&A Logs", lastDebug["Q&A Logs"] || lastDebug.qa_logs || []],
     ["Image Evidence", lastDebug.image_evidence || []],
@@ -11142,7 +12878,7 @@ async function collectUrlOnly() {
       "",
       `- URL: ${seedUrl}`,
       `- 수집 성공: ${data.ok ? "YES" : "NO"}`,
-      `- Source pack chars: ${data.source_pack_chars || 0}`,
+      `- 수집 자료 chars: ${data.source_pack_chars || 0}`,
       `- Pages: ${stats.page_count || quality.pages_collected || 0}`,
       `- Visible text chars: ${stats.visible_text_chars || quality.text_chars || 0}`,
       `- Links: ${stats.link_count || stats.links || quality.links || 0}`,
@@ -11158,7 +12894,7 @@ async function collectUrlOnly() {
       "## 부족한 이유",
       (data.quality_reasons || []).join("\\n") || "없음",
       "",
-      "## Source pack preview",
+      "## 수집 자료 preview",
       data.source_pack_preview || ""
     ].join("\\n");
     lastDraftMarkdown = summary;
