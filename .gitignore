@@ -14,3 +14,15 @@ dist/
 build/
 .cache/
 coverage/
+
+# Study Capture generated artifacts
+runs/
+data/source_packs/
+app_snippets/
+*.before_*
+*.log
+nohup.out
+extraction_brief.txt
+grep_hits_safe.txt
+patch_youtube_extraction_gate.py
+requirements-extractor.txt
