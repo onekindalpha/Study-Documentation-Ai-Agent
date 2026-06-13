@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+from playwright.sync_api import sync_playwright
+
+
+VIDEO_PATTERNS = re.compile(
+    r"(youtube\.com|youtu\.be|vimeo\.com|learn\.microsoft\.com|microsoftstream|stream|video|watch|player|embed)",
+    re.IGNORECASE,
+)
+
+LESSON_PATTERNS = re.compile(
+    r"(lesson|module|unit|course|playlist|player|learn|training|video|watch|lab|exercise|instructions)",
+    re.IGNORECASE,
+)
+
+
+def clean_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def unique_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def classify_url(url: str) -> str:
+    if VIDEO_PATTERNS.search(url):
+        return "video_or_player_candidate"
+    if LESSON_PATTERNS.search(url):
+        return "lesson_or_course_candidate"
+    return "link"
+
+
+def extract_from_page(page, base_url: str) -> dict:
+    title = page.title()
+    current_url = page.url
+
+    visible_text = page.locator("body").inner_text(timeout=10000)
+    visible_text = clean_text(visible_text)
+
+    links = page.eval_on_selector_all(
+        "a[href]",
+        """
+        els => els.map(a => ({
+            text: (a.innerText || a.textContent || '').trim(),
+            href: a.href
+        }))
+        """,
+    )
+
+    frames = page.eval_on_selector_all(
+        "iframe[src]",
+        "els => els.map(x => x.src)",
+    )
+
+    videos = page.eval_on_selector_all(
+        "video source[src], video[src]",
+        """
+        els => els.map(x => x.src || x.getAttribute('src')).filter(Boolean)
+        """,
+    )
+
+    scripts_text = page.eval_on_selector_all(
+        "script",
+        """
+        els => els.map(s => s.textContent || '').join('\\n')
+        """,
+    )
+
+    url_candidates_from_scripts = re.findall(
+        r"https?://[^\\s'\"<>]+",
+        scripts_text or "",
+    )
+
+    normalized_links = []
+    for item in links:
+        href = item.get("href") or ""
+        text = clean_text(item.get("text") or "")
+        if not href:
+            continue
+        href = urljoin(base_url, href)
+        normalized_links.append(
+            {
+                "text": text[:200],
+                "url": href,
+                "kind": classify_url(href + " " + text),
+            }
+        )
+
+    all_url_candidates = []
+    all_url_candidates.extend([x["url"] for x in normalized_links])
+    all_url_candidates.extend(frames or [])
+    all_url_candidates.extend(videos or [])
+    all_url_candidates.extend(url_candidates_from_scripts or [])
+    all_url_candidates = unique_keep_order(all_url_candidates)
+
+    video_url_candidates = [
+        u for u in all_url_candidates
+        if VIDEO_PATTERNS.search(u)
+    ]
+
+    lesson_url_candidates = [
+        u for u in all_url_candidates
+        if LESSON_PATTERNS.search(u)
+    ]
+
+    return {
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "title": title,
+        "current_url": current_url,
+        "visible_text": visible_text,
+        "links": normalized_links,
+        "iframe_urls": unique_keep_order(frames or []),
+        "video_src_urls": unique_keep_order(videos or []),
+        "script_url_candidates": unique_keep_order(url_candidates_from_scripts or []),
+        "video_url_candidates": unique_keep_order(video_url_candidates),
+        "lesson_url_candidates": unique_keep_order(lesson_url_candidates),
+    }
+
+
+def write_outputs(data: dict, output_dir: Path) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_title = re.sub(r"[^a-zA-Z0-9가-힣_-]+", "_", data.get("title") or "source_pack")
+    safe_title = safe_title[:60].strip("_") or "source_pack"
+
+    json_path = output_dir / f"{ts}_{safe_title}.json"
+    md_path = output_dir / f"{ts}_{safe_title}.md"
+
+    json_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    lines = []
+    lines.append(f"# Source Pack: {data.get('title', '')}")
+    lines.append("")
+    lines.append(f"- Captured at: {data.get('captured_at')}")
+    lines.append(f"- Page URL: {data.get('current_url')}")
+    lines.append("")
+    lines.append("## Video URL Candidates")
+    for url in data.get("video_url_candidates", []):
+        lines.append(f"- {url}")
+    lines.append("")
+    lines.append("## Lesson / Course URL Candidates")
+    for url in data.get("lesson_url_candidates", []):
+        lines.append(f"- {url}")
+    lines.append("")
+    lines.append("## All Links")
+    for item in data.get("links", []):
+        text = item.get("text") or "(no text)"
+        url = item.get("url")
+        kind = item.get("kind")
+        lines.append(f"- [{kind}] {text} — {url}")
+    lines.append("")
+    lines.append("## Visible Page Text")
+    lines.append("")
+    lines.append(data.get("visible_text", ""))
+
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return md_path, json_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("url", help="Course, playlist, or lesson URL to collect")
+    parser.add_argument(
+        "--out",
+        default="data/source_packs",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run browser in headless mode. Do not use this if login or Summary click is needed.",
+    )
+    args = parser.parse_args()
+
+    output_dir = Path(args.out)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=args.headless)
+        context = browser.new_context()
+        page = context.new_page()
+
+        print("\nOpening page:")
+        print(args.url)
+        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(3)
+
+        print("\n브라우저가 열렸습니다.")
+        print("1) 필요하면 로그인하세요.")
+        print("2) Summary / Transcript / 강의 목록을 직접 펼치세요.")
+        print("3) 수집할 화면이 준비되면 터미널로 돌아와 Enter를 누르세요.")
+        input("\n준비되면 Enter: ")
+
+        page.wait_for_timeout(1500)
+
+        data = extract_from_page(page, args.url)
+        md_path, json_path = write_outputs(data, output_dir)
+
+        print("\n수집 완료")
+        print(f"Markdown: {md_path}")
+        print(f"JSON: {json_path}")
+        print(f"Visible text chars: {len(data.get('visible_text', ''))}")
+        print(f"Links: {len(data.get('links', []))}")
+        print(f"Video candidates: {len(data.get('video_url_candidates', []))}")
+        print(f"Lesson candidates: {len(data.get('lesson_url_candidates', []))}")
+
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
