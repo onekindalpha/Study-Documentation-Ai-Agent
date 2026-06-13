@@ -35,6 +35,7 @@ def node_to_markdown(node: dict[str, Any], depth: int = 2) -> str:
 
 def graph_to_source_pack(graph: dict[str, Any]) -> str:
     q = graph.get("quality") or {}
+    curriculum = graph.get("curriculum_overview") if isinstance(graph.get("curriculum_overview"), list) else []
     lines = [
         f"# Source Pack: {graph.get('title') or graph.get('input_url')}",
         "",
@@ -57,8 +58,23 @@ def graph_to_source_pack(graph: dict[str, Any]) -> str:
         f"- Missing: {', '.join(q.get('missing') or [])}",
         f"- Warnings: {', '.join(q.get('warnings') or [])}",
         "",
-        "## Collected Nodes",
     ]
+    if graph.get("summary_hint"):
+        lines.extend([
+            "## Source Structure Summary",
+            str(graph.get("summary_hint") or ""),
+            "",
+        ])
+    if curriculum:
+        lines.append("## Curriculum Overview")
+        for item in curriculum[:40]:
+            lesson = str(item.get("lesson") or "").strip()
+            title = str(item.get("title") or "").strip()
+            briefing = str(item.get("briefing") or "").strip()
+            prefix = f"Lesson {lesson}: " if lesson else ""
+            lines.append(f"- {prefix}{title}" + (f" — {briefing}" if briefing else ""))
+        lines.append("")
+    lines.append("## Collected Nodes")
     for node in graph.get("nodes") or []:
         lines.append("")
         lines.append(node_to_markdown(node, 2))

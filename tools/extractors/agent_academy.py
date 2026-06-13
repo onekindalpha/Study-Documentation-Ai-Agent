@@ -53,6 +53,34 @@ def extract_lesson_links(course_page, course_url: str, max_pages: int) -> list[d
     return result[:max_pages]
 
 
+def extract_curriculum_overview(text: str) -> list[dict[str, str]]:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    try:
+        start = next(i for i, line in enumerate(lines) if "Curriculum Overview" in line)
+    except StopIteration:
+        return []
+
+    overview: list[dict[str, str]] = []
+    i = start + 1
+    while i < len(lines):
+        line = lines[i]
+        if line in {"NOTE", "Evidence:"} or line.startswith("✅"):
+            break
+        if line.isdigit() and len(line) <= 2:
+            number = line.zfill(2)
+            j = i + 1
+            while j < len(lines) and len(lines[j]) <= 3:
+                j += 1
+            title = lines[j] if j < len(lines) else f"Lesson {number}"
+            briefing = lines[j + 1] if j + 1 < len(lines) else ""
+            if title.lower() not in {"lesson", "title", "mission briefing"}:
+                overview.append({"lesson": number, "title": title, "briefing": briefing})
+            i = j + 2
+            continue
+        i += 1
+    return overview[:20]
+
+
 def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: bool = False, max_depth: int = 1, timeout: int = 30, **kwargs) -> dict[str, Any]:
     root = fetch_page_data(url, timeout=timeout, render=False)
     trace.event("agent_academy_root_fetched", title=root.title, links=len(root.links), text_chars=len(root.text))
@@ -60,7 +88,9 @@ def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: boo
     trace.event("agent_academy_course_entry_selected", course_url=course_url)
     course = fetch_page_data(course_url, timeout=timeout, render=False)
     lesson_links = extract_lesson_links(course, course_url, max_pages=max_pages)
+    curriculum = extract_curriculum_overview(course.text)
     trace.event("agent_academy_lesson_links_extracted", lesson_count=len(lesson_links))
+    trace.event("agent_academy_curriculum_overview_extracted", item_count=len(curriculum))
 
     graph = make_graph(
         input_url=url,
@@ -72,6 +102,8 @@ def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: boo
         evidence_targets=plan.evidence_targets,
         title=course.title or root.title or "Microsoft Agent Academy",
     )
+    graph["curriculum_overview"] = curriculum
+    graph["summary_hint"] = "Agent Academy Recruit curriculum: Copilot Studio setup, declarative/custom agents, Topics, Adaptive Cards, Agent Flows, publishing, licensing, and badge validation."
 
     course_node = make_node(
         node_type="course",
@@ -94,7 +126,19 @@ def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: boo
             evidence += [{"type": "code", "text": c[:2000]} for c in page.code_blocks[:10]]
             lab_links = [l for l in page.links if any(k in ((l.get("text") or "") + " " + (l.get("url") or "")).lower() for k in ["lab", "exercise", "github", "learn"])]
             evidence += [{"type": "external_link", "text": l.get("text") or l.get("url"), "url": l.get("url")} for l in lab_links[:20]]
-            children.append(make_node(node_type="lesson", title=page.title or item["title"], url=item["url"], order=idx, text=page.text[:16000], evidence=evidence))
+            overview_item = next((row for row in curriculum if row.get("lesson") == f"{idx - 1:02d}"), {})
+            children.append(make_node(
+                node_type="lesson",
+                title=page.title or item["title"],
+                url=item["url"],
+                order=idx,
+                text=page.text[:16000],
+                evidence=evidence,
+                meta={
+                    "curriculum_lesson": overview_item.get("lesson", ""),
+                    "mission_briefing": overview_item.get("briefing", ""),
+                },
+            ))
             graph["quality"]["pages_collected"] += 1
             graph["quality"]["images_collected"] += len(page.images)
             graph["assets"].extend({"type": "image", **img} for img in page.images[:10])

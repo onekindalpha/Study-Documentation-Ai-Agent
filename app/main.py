@@ -892,6 +892,114 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
     before = {path.resolve() for path in output_dir.glob("*.md")}
     host = (urlparse(url).netloc or "").lower()
     is_ai_skills = "aiskillsnavigator.microsoft.com" in host
+    universal_collector = BASE_DIR / "tools" / "universal_learning_collector.py"
+    evidence_ranker = BASE_DIR / "tools" / "evidence_ranker.py"
+    universal_attempt: dict[str, Any] = {}
+    if universal_collector.exists() and not is_ai_skills:
+        universal_cmd = [
+            os.sys.executable,
+            str(universal_collector),
+            url,
+            "--output-root",
+            str(DATA_DIR / "source_packs"),
+            "--run-id",
+            safe_run,
+            "--max-pages",
+            "24",
+            "--max-depth",
+            "2",
+            "--timeout",
+            str(min(90, max(30, timeout_seconds // 4))),
+            "--json",
+        ]
+        started = time.perf_counter()
+        print(f"[collector] run_id={safe_run} seed_url={url}")
+        print(f"[collector] script={universal_collector} out={output_dir} universal=true")
+        try:
+            proc = subprocess.run(
+                universal_cmd,
+                cwd=str(BASE_DIR),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            proc = subprocess.CompletedProcess(
+                universal_cmd,
+                124,
+                stdout=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else f"timeout after {timeout_seconds}s",
+            )
+        md_path = output_dir / "source_pack.md"
+        json_path = output_dir / "source_graph.json"
+        report_path = output_dir / "collection_report.json"
+        rank_path = output_dir / "evidence_rank.json"
+        article_brief_path = output_dir / "article_brief.md"
+        rank_stdout = ""
+        rank_stderr = ""
+        if json_path.exists() and evidence_ranker.exists():
+            rank_proc = subprocess.run(
+                [os.sys.executable, str(evidence_ranker), str(output_dir), "--top-k", "8"],
+                cwd=str(BASE_DIR),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=min(60, timeout_seconds),
+                check=False,
+            )
+            rank_stdout = rank_proc.stdout[-4000:]
+            rank_stderr = rank_proc.stderr[-4000:]
+        if md_path.exists() and json_path.exists():
+            text = md_path.read_text(encoding="utf-8", errors="replace")
+            if article_brief_path.exists():
+                text = text.rstrip() + "\n\n" + article_brief_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            quality = payload.get("quality") if isinstance(payload.get("quality"), dict) else {}
+            stats = {
+                "page_count": int(quality.get("pages_collected") or 0),
+                "visible_text_chars": int(quality.get("text_chars") or len(text or "")),
+                "link_count": len(payload.get("links") or []),
+                "video_candidate_count": len(payload.get("videos") or []),
+                "lesson_candidate_count": len(payload.get("nodes") or []),
+                "lab_candidate_count": int(quality.get("lab_steps") or 0),
+            }
+            report = {
+                "ok": True,
+                "collector": "universal_learning_collector",
+                "collector_returncode": proc.returncode,
+                "command": universal_cmd,
+                "markdown_path": str(md_path),
+                "json_path": str(json_path),
+                "collection_report_path": str(report_path) if report_path.exists() else "",
+                "evidence_rank_path": str(rank_path) if rank_path.exists() else "",
+                "article_brief_path": str(article_brief_path) if article_brief_path.exists() else "",
+                "quality": quality,
+                "stats": stats,
+                "stdout": (proc.stdout + "\n" + rank_stdout)[-4000:],
+                "stderr": (proc.stderr + "\n" + rank_stderr)[-4000:],
+                "elapsed_seconds": round(time.perf_counter() - started, 2),
+                "run_id": safe_run,
+                "seed_url": url,
+            }
+            print(f"[collector] universal ok md={md_path} elapsed={report['elapsed_seconds']}s stats={stats}")
+            return text, report
+        universal_attempt = {
+            "collector": "universal_learning_collector",
+            "command": universal_cmd,
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[-4000:],
+            "stderr": (proc.stderr or "")[-4000:],
+            "markdown_path": str(md_path) if md_path.exists() else "",
+            "json_path": str(json_path) if json_path.exists() else "",
+            "collection_report_path": str(report_path) if report_path.exists() else "",
+        }
+        print(f"[collector] universal failed code={proc.returncode}; falling back to legacy collector")
+
     profile_dir = DATA_DIR / "browser_profiles" / ("source-collector" if is_ai_skills else safe_run)
     collector_v2 = BASE_DIR / "tools" / "source_graph_collect_v2.py"
     legacy_collector = BASE_DIR / "tools" / "collect_source_pack.py"
@@ -942,6 +1050,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
             "stderr": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
             "elapsed_seconds": round(time.perf_counter() - started, 2),
+            "fallback_from_universal": universal_attempt,
         }
 
     after = sorted(
@@ -958,6 +1067,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             "stdout": proc.stdout[-4000:],
             "stderr": proc.stderr[-4000:],
             "elapsed_seconds": round(time.perf_counter() - started, 2),
+            "fallback_from_universal": universal_attempt,
         }
     md_path = after[0]
     text = md_path.read_text(encoding="utf-8", errors="replace")
@@ -986,6 +1096,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
                 "stdout": proc.stdout[-4000:],
                 "stderr": proc.stderr[-4000:],
                 "elapsed_seconds": round(time.perf_counter() - started, 2),
+                "fallback_from_universal": universal_attempt,
             }
     quality: dict[str, Any] = {}
     stats: dict[str, Any] = {}
@@ -1021,6 +1132,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
             "stdout": proc.stdout[-4000:],
             "stderr": proc.stderr[-4000:],
             "elapsed_seconds": round(time.perf_counter() - started, 2),
+            "fallback_from_universal": universal_attempt,
         }
     print(f"[collector] ok md={md_path} elapsed={round(time.perf_counter() - started, 2)}s stats={stats}")
     return text, {
@@ -1033,6 +1145,7 @@ def run_source_pack_collector(url: str, timeout_seconds: int = 420, run_id: str 
         "stdout": proc.stdout[-4000:],
         "stderr": proc.stderr[-4000:],
         "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "fallback_from_universal": universal_attempt,
     }
 
 
@@ -1146,8 +1259,31 @@ def collector_source_graph(collector_report: dict[str, Any], max_nodes: int = 30
             "text_chars": len(visible),
             "headings": headings,
         })
+    if not nodes and isinstance(payload.get("nodes"), list):
+        flat_nodes: list[dict[str, Any]] = []
+
+        def walk(items: list[dict[str, Any]]) -> None:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                flat_nodes.append(item)
+                children = item.get("children")
+                if isinstance(children, list):
+                    walk(children)
+
+        walk(payload.get("nodes") or [])
+        for idx, node in enumerate(flat_nodes[:max_nodes], start=1):
+            text = str(node.get("text") or "")
+            nodes.append({
+                "order": idx,
+                "type": str(node.get("type") or node.get("node_type") or "page"),
+                "title": str(node.get("title") or "")[:200],
+                "url": str(node.get("url") or ""),
+                "text_chars": len(text),
+                "headings": [str(node.get("title") or "")[:140]] if node.get("title") else [],
+            })
     if not nodes:
-        current_url = str(payload.get("current_url") or collector_report.get("seed_url") or "")
+        current_url = str(payload.get("current_url") or payload.get("input_url") or collector_report.get("seed_url") or "")
         title = str(payload.get("title") or "")
         nodes.append({
             "order": 1,
@@ -1159,7 +1295,7 @@ def collector_source_graph(collector_report: dict[str, Any], max_nodes: int = 30
         })
     return {
         "title": payload.get("title") or "",
-        "current_url": payload.get("current_url") or "",
+        "current_url": payload.get("current_url") or payload.get("input_url") or "",
         "stats": stats or {},
         "quality": quality or {},
         "nodes": nodes,
@@ -1236,6 +1372,12 @@ def source_pack_quality_sufficient(seed_url: str, source_pack_text: str, collect
     warnings = quality.get("warnings") or []
     warnings = warnings if isinstance(warnings, list) else []
     reasons: list[str] = []
+    if collector_report.get("collector") == "universal_learning_collector":
+        quality_status = str(quality.get("quality_status") or "").lower()
+        if quality_status == "fail" or quality.get("can_generate_article") is False:
+            missing = quality.get("missing") if isinstance(quality.get("missing"), list) else []
+            detail = "; ".join(str(item) for item in missing[:3]) if missing else "collector marked source pack as not enough for article generation"
+            reasons.append(f"universal collector quality gate failed: {detail}")
     has_substantial_evidence = (
         text_chars >= 8000
         and page_count >= 2
@@ -1495,18 +1637,19 @@ def source_graph_key_headings(collector_report: dict[str, Any], limit: int = 28)
 def source_graph_stats_summary(collector_report: dict[str, Any]) -> dict[str, int]:
     graph = collector_source_graph(collector_report)
     stats = graph.get("stats") if isinstance(graph.get("stats"), dict) else {}
+    quality = graph.get("quality") if isinstance(graph.get("quality"), dict) else {}
     def as_int(key: str, fallback: int = 0) -> int:
         try:
             return int(stats.get(key) or fallback)
         except Exception:
             return fallback
     return {
-        "pages": as_int("page_count", len(graph.get("nodes", []))),
-        "chars": as_int("visible_text_chars", 0),
+        "pages": as_int("page_count", int(quality.get("pages_collected") or len(graph.get("nodes", [])))),
+        "chars": as_int("visible_text_chars", int(quality.get("text_chars") or 0)),
         "links": as_int("link_count", 0),
         "videos": as_int("video_candidate_count", len(graph.get("video_url_candidates", []))),
         "lessons": as_int("lesson_candidate_count", len(graph.get("lesson_url_candidates", []))),
-        "labs": as_int("lab_candidate_count", len(graph.get("lab_url_candidates", []))),
+        "labs": as_int("lab_candidate_count", int(quality.get("lab_steps") or len(graph.get("lab_url_candidates", [])))),
         "tree_items": as_int("tree_item_count", len(graph.get("tree_items", []))),
     }
 
@@ -3675,15 +3818,19 @@ def is_azure_devops_mcp_context(raw_text: str, memo: str) -> bool:
 
 def is_microsoft_foundry_first_agent_context(raw_text: str, memo: str) -> bool:
     source = f"{raw_text}\n{memo}".lower()
-    markers = [
+    if is_agent_academy_context(raw_text, memo):
+        return False
+    strong_markers = [
         "mslearn-agent-quickstart",
         "develop your first agent with microsoft",
         "get-started-in-foundry",
         "continue-in-vscode",
         "use-agent",
-        "first agent",
     ]
-    return "microsoft foundry" in source and any(marker in source for marker in markers)
+    return (
+        ("microsoft foundry" in source or "azure ai foundry" in source)
+        and any(marker in source for marker in strong_markers)
+    )
 
 
 def is_foundry_iq_mcp_rag_context(raw_text: str, memo: str) -> bool:
@@ -3699,6 +3846,23 @@ def is_foundry_iq_mcp_rag_context(raw_text: str, memo: str) -> bool:
             "dynamic tool discovery",
         ]
     )
+
+
+def is_agent_academy_context(raw_text: str, memo: str) -> bool:
+    source = f"{raw_text}\n{memo}".lower()
+    if "microsoft.github.io/agent-academy" in source or "agent academy" in source:
+        return True
+    markers = [
+        "microsoft copilot studio",
+        "declarative agent",
+        "custom agent",
+        "adaptive cards",
+        "agent flows",
+        "publish your agent",
+        "microsoft 365 copilot",
+        "sharepoint site",
+    ]
+    return sum(1 for marker in markers if marker in source) >= 4
 
 
 
@@ -3797,7 +3961,8 @@ def can_generate_url_assisted_medium_draft(
         token in lowered for token in ["헷갈", "모르", "궁금", "요청", "정리", "medium", "초안", "문제해결"]
     )
     if (
-        is_microsoft_foundry_first_agent_context(raw_text, memo)
+        is_agent_academy_context(raw_text, memo)
+        or is_microsoft_foundry_first_agent_context(raw_text, memo)
         or is_azure_devops_mcp_context(raw_text, memo)
         or is_github_agentic_context(raw_text, memo)
         or is_agent_orchestration_context(raw_text, memo)
@@ -3814,6 +3979,8 @@ def compact_user_intent(raw_text: str, memo: str) -> str:
         return "파이썬 문법과 자료구조를 코딩테스트 문제 풀이 기준으로 재구성하는 것"
     if is_oopy_cs_notes_context(raw_text, memo):
         return "CS 핵심 요약을 기술 면접 질문에 답할 수 있는 구조로 재정리하는 것"
+    if is_agent_academy_context(raw_text, memo):
+        return "Agent Academy의 Copilot Studio agent 과정을 환경 준비, 지식 원천, 대화 흐름, UI 입력, 자동화, 배포 검증 기준으로 이해하는 것"
     if is_microsoft_foundry_first_agent_context(raw_text, memo):
         return "Microsoft Foundry에서 첫 agent를 만들고 VS Code로 이어서 실행·테스트하는 실습 흐름을 이해하는 것"
     if is_azure_devops_mcp_context(raw_text, memo):
@@ -3859,6 +4026,9 @@ def optional_confirmation_items(raw_text: str, memo: str, qa_logs: list[dict[str
     elif is_oopy_cs_notes_context(raw_text, memo):
         items.append("가장 헷갈렸던 CS 질문이나 면접 꼬리 질문이 있으면 문제 인식 섹션을 더 구체화할 수 있습니다.")
         items.append("운영체제/네트워크/자료구조 중 우선순위가 있으면 복습 계획을 더 선명하게 정리할 수 있습니다.")
+    elif is_agent_academy_context(raw_text, memo):
+        items.append("실제로 만든 agent가 declarative agent인지 custom agent인지 확인되면 문제 해결 경험을 더 정확하게 쓸 수 있습니다.")
+        items.append("Adaptive Cards나 Agent Flows에서 사용한 입력/자동화 결과가 있으면 복잡한 문제 해결 섹션을 더 구체화할 수 있습니다.")
     elif is_microsoft_foundry_first_agent_context(raw_text, memo):
         items.append("Foundry 포털에서 생성한 agent와 VS Code에서 이어서 확인한 파일/실행 화면이 있으면 실습 흐름을 더 구체화할 수 있습니다.")
         items.append("use-agent 단계의 실제 테스트 입력과 응답 결과가 확인되면 검증 기준을 더 명확히 쓸 수 있습니다.")
@@ -4069,6 +4239,16 @@ def practical_problem_steps_for_topic(kind: str) -> list[dict[str, str]]:
 def source_derived_terms(raw_text: str, memo: str, limit: int = 8) -> list[str]:
     source = f"{raw_text}\n{memo}"
     preferred = [
+        "Agent Academy",
+        "Microsoft Copilot Studio",
+        "declarative agent",
+        "custom agent",
+        "Topics",
+        "Adaptive Cards",
+        "Agent Flows",
+        "SharePoint",
+        "Microsoft 365 Copilot",
+        "Teams",
         "Microsoft Foundry",
         "Foundry IQ",
         "MCP",
@@ -4176,6 +4356,35 @@ def microsoft_foundry_first_agent_steps() -> list[dict[str, str]]:
     ]
 
 
+def agent_academy_copilot_studio_steps() -> list[dict[str, str]]:
+    return [
+        {
+            "title": "Copilot Studio 실습 환경과 데이터 원천 준비",
+            "problem": "Agent Academy의 첫 난점은 agent 기능 자체보다 Microsoft 365 개발 테넌트, Copilot Studio 접근 권한, SharePoint 사이트 같은 준비 조건이 agent 동작의 전제가 된다는 점이었다.",
+            "action": "Course Setup에서 계정, Copilot Studio 환경, SharePoint site를 먼저 분리하고, 이후 미션에서 SharePoint가 agent 지식 원천으로 쓰이는 흐름을 연결했다.",
+            "verification": "agent를 만들기 전에 어떤 계정과 환경이 필요하고, SharePoint가 단순 예제가 아니라 grounding 데이터 원천으로 쓰인다는 점을 설명할 수 있는지 확인했다.",
+        },
+        {
+            "title": "Declarative agent와 custom agent의 역할 구분",
+            "problem": "Agent Academy는 declarative agent와 custom agent를 모두 다루기 때문에, prompt로 Microsoft 365 Copilot을 확장하는 방식과 Copilot Studio에서 별도 agent를 구성하는 방식을 구분해야 했다.",
+            "action": "Create a Declarative Agent, Build a Custom Agent 미션을 기준으로 agent 유형별 목적, 생성 위치, 지식 연결 방식, 배포 대상을 나누어 정리했다.",
+            "verification": "declarative agent는 M365 Copilot 확장 흐름으로, custom agent는 Copilot Studio 안에서 지식과 대화 흐름을 구성하는 방식으로 설명할 수 있는지 확인했다.",
+        },
+        {
+            "title": "Topics, Adaptive Cards, Agent Flows의 확장 구조 이해",
+            "problem": "agent가 단순 질의응답을 넘어서려면 Topics, Adaptive Cards, Agent Flows가 각각 무엇을 확장하는지 구분해야 했다.",
+            "action": "Topics는 사용자 질문을 특정 경로로 라우팅하는 대화 흐름, Adaptive Cards는 입력과 표시 UI, Agent Flows는 카드 입력을 백엔드 자동화로 연결하는 단계로 재배치했다.",
+            "verification": "사용자 입력이 topic trigger를 거쳐 card 입력으로 정리되고, flow를 통해 후속 작업으로 이어지는 구조를 한 흐름으로 설명할 수 있는지 확인했다.",
+        },
+        {
+            "title": "Teams와 Microsoft 365 Copilot 배포 기준 정리",
+            "problem": "마지막 publish 단계는 단순 완료 버튼이 아니라, 만든 agent가 실제 사용 채널에서 동작 가능한 상태인지 확인하는 검증 지점이었다.",
+            "action": "Publish Your Agent와 licensing 내용을 연결해 Teams, Microsoft 365 Copilot, 라이선스/권한 조건을 배포 검증 기준으로 정리했다.",
+            "verification": "agent를 만들었다는 사실이 아니라 어디에 배포되고, 누가 사용할 수 있으며, 어떤 권한·라이선스 조건을 확인해야 하는지 설명할 수 있는지 확인했다.",
+        },
+    ]
+
+
 def foundry_iq_mcp_rag_steps() -> list[dict[str, str]]:
     return [
         {
@@ -4223,11 +4432,12 @@ def build_url_assisted_medium_draft(
     source = f"{raw_text}\n{memo}"
     wikidocs_coding = is_wikidocs_coding_test_context(raw_text, memo)
     oopy_cs_notes = is_oopy_cs_notes_context(raw_text, memo)
+    agent_academy = is_agent_academy_context(raw_text, memo)
     foundry_first_agent = is_microsoft_foundry_first_agent_context(raw_text, memo)
     foundry_iq_mcp_rag = is_foundry_iq_mcp_rag_context(raw_text, memo) and not foundry_first_agent
     azure = is_azure_devops_mcp_context(raw_text, memo)
-    agent_orch = is_agent_orchestration_context(raw_text, memo) and not azure and not foundry_first_agent and not foundry_iq_mcp_rag
-    github = is_github_agentic_context(raw_text, memo) and not azure and not agent_orch and not foundry_first_agent and not foundry_iq_mcp_rag
+    agent_orch = is_agent_orchestration_context(raw_text, memo) and not azure and not agent_academy and not foundry_first_agent and not foundry_iq_mcp_rag
+    github = is_github_agentic_context(raw_text, memo) and not azure and not agent_academy and not agent_orch and not foundry_first_agent and not foundry_iq_mcp_rag
     steps = problem_map.get("solution_steps", []) if isinstance(problem_map.get("solution_steps"), list) else []
     if not steps:
         steps = build_text_assisted_solution_steps(article_type, raw_text, memo)
@@ -4239,6 +4449,9 @@ def build_url_assisted_medium_draft(
         steps = build_text_assisted_solution_steps("coding_test_python_learning", raw_text, memo)
     elif oopy_cs_notes:
         steps = build_text_assisted_solution_steps("cs_learning_notes", raw_text, memo)
+    elif agent_academy:
+        if not steps or sum(not is_weak_learning_step(step) for step in steps[:4]) < 2:
+            steps = agent_academy_copilot_studio_steps()
     elif foundry_first_agent:
         if not steps or sum(not is_weak_learning_step(step) for step in steps[:4]) < 2:
             steps = microsoft_foundry_first_agent_steps()
@@ -4280,6 +4493,20 @@ def build_url_assisted_medium_draft(
         key_terms = ["CS", "운영체제", "네트워크", "자료구조", "알고리즘", "데이터베이스", "면접 질문", "꼬리 질문"]
         final_result = "흩어진 CS 요약 내용을 면접 질문에 답할 수 있는 설명 단위와 복습 기준으로 나누어 정리했다."
         skills = ["Structuring CS concepts for interviews", "Separating definitions and principles", "Preparing follow-up question answers", "Organizing broad CS review scope", "Writing interview-oriented study notes"]
+    elif agent_academy:
+        title = "Agent Academy 학습: Copilot Studio Agent를 설계·확장·배포 흐름으로 이해하기"
+        subtitle = "Understanding Copilot Studio agents, topics, adaptive cards, flows, and publishing"
+        core_problem = "Agent Academy에서 Copilot Studio agent를 단순 챗봇 생성이 아니라 지식 원천, 대화 흐름, UI 입력, 자동화, 배포 기준까지 연결된 실무형 agent 구축 문제로 이해하는 것이 핵심 문제였다."
+        key_terms = ["Agent Academy", "Microsoft Copilot Studio", "SharePoint", "declarative agent", "custom agent", "Topics", "Adaptive Cards", "Agent Flows", "Teams", "Microsoft 365 Copilot"]
+        final_result = "Agent Academy Recruit 과정을 환경 준비, declarative/custom agent 생성, Topics와 Adaptive Cards 확장, Agent Flows 자동화, Teams와 Microsoft 365 Copilot 배포 검증 흐름으로 정리했다."
+        skills = [
+            "Understanding Microsoft Copilot Studio agent architecture",
+            "Separating declarative and custom agent patterns",
+            "Grounding agents with SharePoint knowledge sources",
+            "Designing topic-triggered conversation paths",
+            "Connecting Adaptive Cards with Agent Flows",
+            "Defining publishing and licensing validation criteria",
+        ]
     elif foundry_first_agent:
         title = "Microsoft Foundry 첫 Agent 실습: 생성·VS Code 연동·실행 흐름 이해하기"
         subtitle = "Understanding first-agent creation, VS Code continuation, and lab validation"
@@ -4370,6 +4597,8 @@ def build_url_assisted_medium_draft(
         lines.append("이번 학습은 WikiDocs의 파이썬 코딩테스트 내용을 단순 목차 순서로 읽는 데서 멈추지 않고, 실제 문제 풀이에서 어떤 개념을 언제 사용하는지 기준으로 재정리하는 데 초점을 두었다. 핵심은 문법 암기가 아니라 입력 조건, 자료구조 선택, 시간 복잡도 판단, 스택 활용을 문제 해결 흐름으로 연결하는 것이었다.")
     elif oopy_cs_notes:
         lines.append("이번 학습은 CS 핵심요약집을 단순 암기 목록으로 보는 대신, 기술 면접에서 설명 가능한 답변 구조로 바꾸는 데 초점을 두었다. 핵심은 운영체제, 네트워크, 자료구조 같은 개념을 정의만 외우는 것이 아니라 원리, 비교 기준, 예시, 꼬리 질문 대응까지 연결하는 것이었다.")
+    elif agent_academy:
+        lines.append("이번 학습은 Microsoft Agent Academy Recruit 과정을 따라 Copilot Studio agent를 만드는 흐름을 하나의 구축 문제로 재구성하는 데서 출발했다. 핵심은 agent를 단순히 생성하는 것이 아니라 Microsoft 365 환경 준비, SharePoint 기반 지식 연결, declarative/custom agent 구분, Topics·Adaptive Cards·Agent Flows 확장, Teams와 Microsoft 365 Copilot 배포 기준까지 이어지는 전체 구조를 이해하는 것이었다.")
     elif foundry_first_agent:
         lines.append("이번 실습은 Microsoft Foundry에서 첫 agent를 만들고, VS Code로 이어서 작업 흐름을 확인한 뒤, use-agent 단계에서 실행과 테스트 기준을 잡는 과정으로 보았다. 핵심은 Foundry라는 이름만 보고 다른 주제로 넓히는 것이 아니라, quickstart 자료에 실제로 남아 있는 setup, agent 생성, continuation, 사용/검증 단서를 순서대로 이해하는 것이었다.")
     elif foundry_iq_mcp_rag:
@@ -4404,6 +4633,10 @@ def build_url_assisted_medium_draft(
         lines.append("처음 문제로 인식한 부분은 CS 요약 자료가 넓은 개념 목록으로 흩어져 있어, 면접에서 바로 설명 가능한 답변 구조로 연결되지 않는다는 점이었다. 운영체제, 네트워크, 자료구조 같은 항목은 정의를 아는 것만으로는 꼬리 질문이나 비교 질문에 대응하기 어렵다.")
         lines.append("")
         lines.append("그래서 이 학습은 요약집을 다시 읽는 것이 아니라, 각 개념을 질문 대응 단위로 재구성하는 과정으로 보았다. 정의, 원리, 예시, 차이점, 대표 질문을 분리해야 실제 면접 답변으로 연결할 수 있었다.")
+    elif agent_academy:
+        lines.append("처음 문제로 인식한 부분은 Agent Academy가 여러 미션을 순서대로 보여 주지만, 실제 학습자는 각 미션이 agent 구축의 어느 계층을 담당하는지 분리해야 한다는 점이었다. Course Setup은 환경과 데이터 원천 준비이고, declarative/custom agent 미션은 agent 유형 선택이며, Topics·Adaptive Cards·Agent Flows는 대화 흐름과 자동화를 확장하는 단계다.")
+        lines.append("")
+        lines.append("그래서 이 학습은 Agent Academy를 기능 목록으로 요약하는 것이 아니라, Copilot Studio agent를 실무에서 사용할 수 있게 만들기 위해 필요한 설계·확장·검증 흐름으로 재구성하는 과정으로 보았다.")
     elif foundry_first_agent:
         lines.append("처음 헷갈린 지점은 Foundry 포털에서 agent를 만드는 단계와 VS Code로 이어서 확인하는 단계의 경계였다. 같은 quickstart 안에 setup, 생성, continuation, 실행 테스트가 이어지기 때문에 각 단계가 무엇을 준비하고 무엇을 검증하는지 나누어 볼 필요가 있었다.")
         lines.append("")
@@ -4435,6 +4668,8 @@ def build_url_assisted_medium_draft(
         lines.append("이 문제는 문법 설명을 더 많이 읽는 것으로 해결되지 않는다. 입력 조건을 읽고, 필요한 자료구조를 고르고, 시간 복잡도를 점검하고, 풀이 전략을 세우는 기준으로 다시 정리해야 한다.")
     elif oopy_cs_notes:
         lines.append("이 문제는 CS 키워드를 더 많이 외우는 것으로 해결되지 않는다. 각 개념을 면접 질문에 답할 수 있는 구조, 즉 정의·원리·예시·비교·꼬리 질문 기준으로 다시 나누어야 한다.")
+    elif agent_academy:
+        lines.append("이 문제는 Copilot Studio에서 agent를 하나 만드는 것으로 해결되지 않는다. agent가 어떤 지식 원천을 참조하는지, declarative agent와 custom agent 중 어떤 패턴인지, Topics가 어떤 질문을 라우팅하는지, Adaptive Cards와 Agent Flows가 입력과 자동화를 어떻게 연결하는지, 마지막으로 어디에 배포되어 어떤 권한 조건으로 검증되는지까지 연결해야 한다.")
     elif foundry_first_agent:
         lines.append("이 문제는 Foundry라는 제품명만 보고 해결되지 않는다. 첫 agent를 어디서 만들고, VS Code continuation이 어떤 전환점이며, use-agent 단계에서 무엇을 테스트해야 하는지 흐름과 기준을 분리해야 한다.")
     elif foundry_iq_mcp_rag:
@@ -4453,6 +4688,8 @@ def build_url_assisted_medium_draft(
         lines.append("코딩테스트 학습에서 막히는 지점은 대개 개념을 몰라서라기보다, 문제 조건을 보고 어떤 개념을 적용해야 하는지 판단하지 못하는 데서 나온다. 그래서 파이썬 문법과 자료구조를 문제 풀이 기준으로 재구성하는 것을 핵심 문제로 보았다.")
     elif oopy_cs_notes:
         lines.append("CS 면접 학습에서 막히는 지점은 개념 이름을 몰라서라기보다, 짧은 요약을 질문에 대한 설명으로 풀어내지 못하는 데서 나온다. 그래서 요약 자료를 면접 답변 구조로 바꾸는 것을 핵심 문제로 보았다.")
+    elif agent_academy:
+        lines.append("Copilot Studio agent 학습에서 중요한 문제는 agent가 대답한다는 결과보다, 그 대답과 행동이 어떤 설계 요소에서 만들어지는지 설명하는 것이다. SharePoint 지식 원천, topic trigger, Adaptive Card 입력, Agent Flow 자동화, publish 대상이 분리되지 않으면 결과 화면은 보여도 agent가 왜 그렇게 동작하는지 검증하기 어렵다.")
     elif foundry_first_agent:
         lines.append("실습형 자료에서는 개념 이름보다 단계 경계가 더 자주 막힌다. setup, Foundry 포털의 agent 생성, VS Code로 이어지는 작업, use-agent 실행 확인을 구분해야 어떤 부분을 이해했고 어디를 다시 검증해야 하는지 알 수 있다.")
     elif foundry_iq_mcp_rag:
@@ -4521,6 +4758,19 @@ def build_url_assisted_medium_draft(
             "데이터베이스": "데이터 저장, 조회, 트랜잭션, 정규화 같은 백엔드 기초 질문과 연결되는 영역이다.",
             "면접 질문": "개념을 실제 설명 상황으로 바꾸는 확인 단위다.",
             "꼬리 질문": "정의 암기에서 끝나지 않고 원리와 비교까지 이해했는지 확인하는 질문이다.",
+        }
+    elif agent_academy:
+        concept_descriptions = {
+            "Agent Academy": "Copilot Studio agent를 단계별 미션으로 학습하며 설계, 확장, 배포 기준을 익히는 과정이다.",
+            "Microsoft Copilot Studio": "지식 원천, 대화 흐름, Topics, actions/flows를 구성해 business agent를 만드는 핵심 도구다.",
+            "SharePoint": "agent가 답변 근거로 사용할 수 있는 조직 데이터 원천이며, setup 이후 미션에서 grounding 기준이 된다.",
+            "declarative agent": "Microsoft 365 Copilot 안에서 prompt와 지식 기반으로 특정 목적의 agent 경험을 정의하는 방식이다.",
+            "custom agent": "Copilot Studio에서 지식, Topics, 동작 흐름을 더 직접 구성하는 agent 구축 방식이다.",
+            "Topics": "사용자 질문을 특정 대화 경로와 응답 흐름으로 연결하는 trigger 기반 구성 요소다.",
+            "Adaptive Cards": "agent 대화 안에서 구조화된 정보 표시와 사용자 입력을 받기 위한 UI 요소다.",
+            "Agent Flows": "Adaptive Card 입력이나 agent 이벤트를 백엔드 자동화와 연결하는 실행 흐름이다.",
+            "Microsoft 365 Copilot": "만든 agent를 조직 생산성 도구 안에서 사용할 수 있게 하는 배포 대상이다.",
+            "Teams": "완성한 agent를 실제 협업 채널에서 검증할 수 있는 배포·사용 환경이다.",
         }
     elif foundry_first_agent:
         concept_descriptions = {
@@ -5803,6 +6053,18 @@ ARTICLE_TYPE_KEYWORDS = {
         "use-agent",
         "first agent",
     ],
+    "agent_academy_copilot_studio": [
+        "agent academy",
+        "microsoft.github.io/agent-academy",
+        "microsoft copilot studio",
+        "declarative agent",
+        "custom agent",
+        "adaptive cards",
+        "agent flows",
+        "microsoft 365 copilot",
+        "sharepoint site",
+        "publish your agent",
+    ],
     "github_readme_debugging": ["github", "readme", "markdown", "video embed", "image embed", "badge", "repository"],
     "deployment_debugging": ["deploy", "deployment", "build", "hosting", "ci"],
     "cloud_lab_practice": ["aws", "azure", "gcp", "cloud lab", "iam", "s3", "ec2", "lambda", "resource group"],
@@ -5857,6 +6119,12 @@ def classify_article_type_with_confidence(raw_text: str, memo: str, topic: str, 
     source = " ".join([raw_text, memo, topic, extra_info, " ".join(image_names)]).lower()
     compact_source = source.replace(" ", "_").replace("-", "_")
     classification_text = "\n".join([raw_text, topic, extra_info, " ".join(image_names)])
+    if is_agent_academy_context(classification_text, memo):
+        return {
+            "article_type": "agent_academy_copilot_studio",
+            "confidence": 0.97,
+            "candidates": [{"article_type": "agent_academy_copilot_studio", "score": 99}],
+        }
     if is_microsoft_foundry_first_agent_context(classification_text, memo):
         return {
             "article_type": "microsoft_foundry_first_agent",
@@ -8782,6 +9050,9 @@ class Handler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -8886,7 +9157,7 @@ INDEX_HTML = """
     .dropzone:hover, .dropzone.dragover { border-color:var(--brand); background:#101b24; }
     .dropzone strong { display:block; margin-bottom:4px; }
     .dropzone span { color:var(--muted); font-size:13px; }
-    .dropzone input { display:none; }
+    .dropzone input { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
     .file-list { color:#c8d3df; font-size:13px; margin-top:8px; }
     .row { display:flex; gap:10px; flex-wrap:wrap; }
     .stack { display:grid; gap:12px; }
@@ -8936,12 +9207,12 @@ INDEX_HTML = """
         <div id="fileList" class="file-list">선택된 이미지 없음</div>
       </label>
       <textarea id="rawText" placeholder="자료를 넣으세요. 예: 강의 URL, 영상 URL, 실습 URL, 강의안 본문, 화면 텍스트, 오류 메시지"></textarea>
-      <textarea id="memo" placeholder="지금 궁금한 점을 아무렇게나 적으세요. 예: 대충 들었는데 MCP가 뭔지 모르겠음. 퀴즈/막힌 부분도 여기에 입력"></textarea>
+      <textarea id="memo" placeholder="강의에서 어렵거나 복잡했던 문제를 적으세요. 예: 개념 경계, 쿼리, 권한, Lab 실패, 검증 기준"></textarea>
       <details class="advanced">
         <summary>예시 입력 보기 <span class="meta">(선택 · 이미지만 넣어도 생성 가능)</span></summary>
         <pre style="white-space:pre-wrap;background:#0b1017;border:1px solid var(--line);padding:12px;border-radius:8px;">예시 1: 강의 URL / 영상 URL / 실습 URL을 한 번에 붙여넣기
 예시 2: 영상 강의 캡처만 업로드하고 메모 없이 생성
-예시 3: 헷갈린 개념만 한 줄 입력 — 예: workflow_dispatch가 뭔지 헷갈림</pre>
+예시 3: 어렵거나 복잡했던 문제만 한 줄 입력 — 예: 권한 정책 적용 결과가 예상과 다르게 나옴</pre>
       </details>
       <details class="advanced">
         <summary>Medium 글 추가 정보 <span class="meta">(선택 입력 · 몰라도 비워두세요)</span></summary>
@@ -8956,6 +9227,7 @@ INDEX_HTML = """
       <div class="row">
         <button class="secondary" id="clearFilesBtn">이미지 선택 초기화</button>
         <button class="secondary" id="clearInputBtn" type="button">입력칸 초기화</button>
+        <button class="secondary" id="collectUrlBtn" type="button">URL 수집만 테스트</button>
         <button id="portfolioBtn">문제 해결형 Medium 완성본 생성</button>
       </div>
       <div class="result-toolbar">
@@ -9016,7 +9288,30 @@ let lastDebug = null;
 let lastDraftMarkdown = "";
 let activeBlogRequestId = 0;
 
-function show(text) { result.textContent = text; }
+function show(text) {
+  result.textContent = text;
+  if (text && !String(text).includes("아직 생성된 결과")) lastDraftMarkdown = String(text);
+}
+
+function setBusy(button, busy, label) {
+  if (!button) return;
+  if (!button.dataset.defaultText) button.dataset.defaultText = button.textContent;
+  button.disabled = Boolean(busy);
+  button.textContent = busy ? label : button.dataset.defaultText;
+}
+
+function startProgress(message) {
+  const startedAt = Date.now();
+  show(`${message}\n\n경과 시간: 0초\n상태: 요청을 준비하는 중입니다.`);
+  return setInterval(() => {
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    show(`${message}\n\n경과 시간: ${elapsed}초\n상태: 자동수집 또는 글 생성을 진행 중입니다. 브라우저/보호 페이지/긴 강의는 시간이 걸릴 수 있습니다.`);
+  }, 1000);
+}
+
+function stopProgress(timer) {
+  if (timer) clearInterval(timer);
+}
 
 function clearGeneratedArticle() {
   lastDraftMarkdown = "";
@@ -9095,15 +9390,26 @@ function fileKey(file) {
   return `${file.name}-${file.size}-${file.lastModified}`;
 }
 
+function isImageFile(file) {
+  if (!file) return false;
+  if (String(file.type || "").startsWith("image/")) return true;
+  const name = String(file.name || "").toLowerCase();
+  return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic"].some(ext => name.endsWith(ext));
+}
+
 function addSelectedFiles(files) {
+  const incoming = Array.from(files || []).filter(isImageFile);
+  if (!incoming.length) {
+    showToast("이미지 파일만 추가할 수 있습니다.");
+    return;
+  }
   const current = new Map(selectedFiles.map(file => [fileKey(file), file]));
-  Array.from(files || [])
-    .filter(file => file.type.startsWith("image/"))
-    .forEach(file => current.set(fileKey(file), file));
+  incoming.forEach(file => current.set(fileKey(file), file));
   selectedFiles = Array.from(current.values());
   fileList.textContent = selectedFiles.length
     ? selectedFiles.map((file, index) => `${index + 1}. ${file.name}`).join(" · ")
     : "선택된 이미지 없음";
+  showToast(`이미지 ${selectedFiles.length}장 선택됨`);
 }
 
 function clearSelectedFiles() {
@@ -9120,24 +9426,42 @@ document.querySelector("#clearFilesBtn").onclick = clearSelectedFiles;
 
 function handleDragOver(event) {
   event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
   dropzone.classList.add("dragover");
 }
 
-function handleDragLeave() {
+function handleDragLeave(event) {
+  if (event && dropzone.contains(event.relatedTarget)) return;
   dropzone.classList.remove("dragover");
 }
 
 function handleDrop(event) {
   event.preventDefault();
+  event.stopPropagation();
   dropzone.classList.remove("dragover");
-  addSelectedFiles(event.dataTransfer.files);
+  addSelectedFiles(event.dataTransfer ? event.dataTransfer.files : []);
 }
 
 dropzone.ondragover = handleDragOver;
 dropzone.ondragleave = handleDragLeave;
 dropzone.ondrop = handleDrop;
-document.ondragover = handleDragOver;
-document.ondrop = handleDrop;
+document.addEventListener("dragover", event => {
+  event.preventDefault();
+  if (event.dataTransfer && Array.from(event.dataTransfer.items || []).some(item => item.kind === "file")) {
+    dropzone.classList.add("dragover");
+    event.dataTransfer.dropEffect = "copy";
+  }
+});
+document.addEventListener("drop", event => {
+  event.preventDefault();
+  dropzone.classList.remove("dragover");
+  const files = event.dataTransfer ? event.dataTransfer.files : [];
+  if (files && files.length) addSelectedFiles(files);
+});
+document.addEventListener("paste", event => {
+  const files = Array.from(event.clipboardData?.files || []);
+  if (files.length) addSelectedFiles(files);
+});
 
 async function ensureSession() {
   if (currentSession) return currentSession;
@@ -9191,6 +9515,22 @@ function renderDebug(payload) {
     if (btn) btn.onclick = () => showTab(label, value);
   });
   showTab(tabs[0][0], tabs[0][1]);
+}
+
+function extractFirstUrl(text) {
+  const value = String(text || "");
+  const httpIndex = value.indexOf("http://");
+  const httpsIndex = value.indexOf("https://");
+  const candidates = [httpIndex, httpsIndex].filter(index => index >= 0);
+  if (!candidates.length) return "";
+  const start = Math.min(...candidates);
+  const stopChars = [" ", "\\n", "\\t", "<", ">", '"', "'", ")", "]"];
+  let end = value.length;
+  for (const ch of stopChars) {
+    const index = value.indexOf(ch, start);
+    if (index >= 0 && index < end) end = index;
+  }
+  return value.slice(start, end).replace(/[.,;!?]+$/, "");
 }
 
 document.querySelector("#captureBtn").onclick = async () => {
@@ -9294,13 +9634,93 @@ document.querySelector("#searchBtn").onclick = async () => {
   renderNotes(visibleNotes(rows.map(r => r.note)));
 };
 
+async function collectUrlOnly() {
+  const rawText = document.querySelector("#rawText").value.trim();
+  const seedUrl = extractFirstUrl(rawText);
+  if (!seedUrl) {
+    show("수집할 URL을 입력칸에 먼저 넣어 주세요.");
+    return;
+  }
+  const btn = document.querySelector("#collectUrlBtn");
+  setBusy(btn, true, "URL 수집 중...");
+  lastDraftMarkdown = "";
+  debugTabs.innerHTML = "";
+  debugPane.textContent = "URL 자동수집을 실행하는 중입니다.";
+  const progress = startProgress(`URL 수집만 테스트합니다.\n\n${seedUrl}\n\n수집 결과가 충분한지 먼저 확인합니다.`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 900000);
+  try {
+    const res = await fetch("/api/debug-collect-url", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ url: seedUrl, timeout_seconds: 900 }),
+      signal: controller.signal
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const report = data.collector_report || {};
+    const stats = report.stats || {};
+    const quality = report.quality || {};
+    const summary = [
+      "# URL 수집 테스트 결과",
+      "",
+      `- URL: ${seedUrl}`,
+      `- 수집 성공: ${data.ok ? "YES" : "NO"}`,
+      `- Source pack chars: ${data.source_pack_chars || 0}`,
+      `- Pages: ${stats.page_count || quality.pages_collected || 0}`,
+      `- Visible text chars: ${stats.visible_text_chars || quality.text_chars || 0}`,
+      `- Links: ${stats.link_count || stats.links || quality.links || 0}`,
+      `- Videos: ${stats.video_candidate_count || stats.video_candidates || quality.video_candidates || 0}`,
+      `- Lessons: ${stats.lesson_candidate_count || stats.lesson_candidates || quality.lesson_candidates || 0}`,
+      `- Labs: ${stats.lab_candidate_count || stats.lab_candidates || quality.lab_steps || 0}`,
+      `- Markdown: ${report.markdown_path || ""}`,
+      `- JSON: ${report.json_path || ""}`,
+      "",
+      "## 품질 판정",
+      data.quality_sufficient ? "충분함" : "부족함",
+      "",
+      "## 부족한 이유",
+      (data.quality_reasons || []).join("\\n") || "없음",
+      "",
+      "## Source pack preview",
+      data.source_pack_preview || ""
+    ].join("\\n");
+    lastDraftMarkdown = summary;
+    show(summary);
+    renderDebug({
+      draft: summary,
+      collector_report: report,
+      source_pack_preview: data.source_pack_preview || "",
+      critic_report: {
+        passed: Boolean(data.ok),
+        failures: data.quality_reasons || [],
+        metrics: {
+          source_pack_chars: data.source_pack_chars || 0,
+          quality_sufficient: Boolean(data.quality_sufficient)
+        }
+      }
+    });
+  } catch (err) {
+    const message = err && (err.name || err.message) ? `${err.name || "Error"}: ${err.message || ""}` : String(err);
+    show(`URL 수집 테스트가 완료되지 않았습니다.\n\n원인: ${message}`);
+  } finally {
+    stopProgress(progress);
+    clearTimeout(timeout);
+    setBusy(btn, false);
+  }
+}
+
 async function makeBlog(formatType) {
   if (!selectedFiles.length && !document.querySelector("#rawText").value.trim() && !document.querySelector("#memo").value.trim()) {
     show("이미지, 화면 텍스트, 메모 중 하나는 입력해 주세요.");
     return;
   }
+  show("생성 전에 어려운 문제 입력 팝업을 기다리는 중입니다.\\n\\n팝업에서 입력하거나 '비워두고 생성'을 눌러 주세요.");
   const promptNote = await askProblemPrompt();
-  if (promptNote === null) return;
+  if (promptNote === null) {
+    show("생성이 취소되었습니다.");
+    return;
+  }
   const btn = document.querySelector("#portfolioBtn");
   const requestId = ++activeBlogRequestId;
   const seedText = document.querySelector("#rawText").value.trim();
@@ -9316,12 +9736,12 @@ async function makeBlog(formatType) {
     .map(([label, value]) => `- ${label}: ${String(value).trim()}`)
     .join("\\n");
   const topic = document.querySelector("#projectName").value.trim() || "학습 기록 기반 문제 해결 경험";
-  btn.disabled = true;
+  setBusy(btn, true, "생성 중...");
   lastDraftMarkdown = "";
   lastDebug = null;
   debugTabs.innerHTML = "";
   debugPane.textContent = "이번 요청의 자동수집 결과를 기다리는 중입니다.";
-  show(`자동수집을 시작합니다.\n\n입력:\n${seedText.slice(0, 500)}\n\n강의/글/영상/Lab 자료를 먼저 수집한 뒤 글 생성으로 넘어갑니다.`);
+  const progress = startProgress(`자동수집을 시작합니다.\n\n입력:\n${seedText.slice(0, 500) || "이미지/메모 기반 생성"}\n\n강의/글/영상/Lab 자료를 먼저 수집한 뒤 글 생성으로 넘어갑니다.`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 900000);
   try {
@@ -9344,18 +9764,22 @@ async function makeBlog(formatType) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (requestId !== activeBlogRequestId) return;
-    show(`[응답 시간: ${data.elapsed_seconds}s · 이미지 ${data.image_count}장]\\n\\n${data.draft}`);
+    const finalText = `[응답 시간: ${data.elapsed_seconds}s · 이미지 ${data.image_count}장]\n\n${data.draft || "생성된 본문이 비어 있습니다. Debug 탭의 Collector Report를 확인해 주세요."}`;
+    lastDraftMarkdown = finalText;
+    show(finalText);
     renderDebug(data);
   } catch (err) {
     if (requestId !== activeBlogRequestId) return;
     const message = err && (err.name || err.message) ? `${err.name || "Error"}: ${err.message || ""}` : String(err);
     show(`문제 해결형 Medium 글 생성 요청이 완료되지 않았습니다.\n\n원인: ${message}\n\nURL-only 수집이 보호 페이지/로그인/자막 추출/긴 크롤링에 막혔을 수 있습니다. 서버 터미널 로그와 Debug report를 확인해 주세요.`);
   } finally {
+    stopProgress(progress);
     clearTimeout(timeout);
-    if (requestId === activeBlogRequestId) btn.disabled = false;
+    if (requestId === activeBlogRequestId) setBusy(btn, false);
   }
 }
 
+document.querySelector("#collectUrlBtn").onclick = collectUrlOnly;
 document.querySelector("#portfolioBtn").onclick = () => makeBlog("problem-solving-portfolio");
 
 function escapeHtml(text) {

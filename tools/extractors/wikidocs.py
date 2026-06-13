@@ -7,6 +7,29 @@ from tools.collector_core.html_utils import fetch_page_data, same_domain
 from tools.collector_core.schema import make_graph, make_node
 
 
+def is_probable_book_chapter(link_text: str, book_title: str) -> bool:
+    text = f"{link_text}\n{book_title}".lower()
+    if any(bad in text for bad in ["이벤트", "증정", "출판사", "광고", "최근 변경", "댓글", "문의"]):
+        return False
+    chapter_markers = [
+        "문제",
+        "마당",
+        "장 ",
+        "chapter",
+        "코딩 테스트",
+        "파이썬",
+        "자료구조",
+        "스택",
+        "큐",
+        "해시",
+        "트리",
+        "그래프",
+        "정렬",
+        "탐색",
+    ]
+    return any(marker in text for marker in chapter_markers)
+
+
 def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: bool = False, max_depth: int = 1, timeout: int = 30, **kwargs) -> dict[str, Any]:
     book = fetch_page_data(url, timeout=timeout, render=False)
     trace.event("wikidocs_book_page_fetched", title=book.title, links=len(book.links), text_chars=len(book.text))
@@ -18,8 +41,11 @@ def collect(url: str, *, run_dir, trace, plan, max_pages: int = 20, visible: boo
         if not same_domain(href, url) or href in seen:
             continue
         if path.isdigit():
+            title = link.get("text") or f"Chapter {len(chapter_links)+1}"
+            if not is_probable_book_chapter(title, book.title):
+                continue
             seen.add(href)
-            chapter_links.append({"url": href, "title": link.get("text") or f"Chapter {len(chapter_links)+1}"})
+            chapter_links.append({"url": href, "title": title})
     chapter_links = chapter_links[:max_pages]
     trace.event("wikidocs_chapter_links_extracted", chapter_count=len(chapter_links))
 

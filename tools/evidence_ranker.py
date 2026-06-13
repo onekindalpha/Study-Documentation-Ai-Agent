@@ -48,6 +48,17 @@ PROBLEM_KEYWORDS = {
     "모델": 12,
     "데이터": 10,
     "파이프라인": 14,
+    "Copilot Studio": 18,
+    "declarative agent": 18,
+    "custom agent": 18,
+    "Topics": 14,
+    "Adaptive Cards": 18,
+    "Agent Flows": 20,
+    "SharePoint": 12,
+    "Microsoft 365 Copilot": 16,
+    "Teams": 10,
+    "licensing": 12,
+    "publishing": 14,
 }
 
 ANTI_KEYWORDS = {
@@ -249,6 +260,17 @@ def build_article_brief(graph: dict[str, Any], items: list[EvidenceItem]) -> str
         lines.append(f"- Extra outside TOC: {quality.get('extra_collected_outside_toc')}")
         lines.append("")
 
+    curriculum = graph.get("curriculum_overview") if isinstance(graph.get("curriculum_overview"), list) else []
+    if curriculum:
+        lines.append("## Curriculum flow")
+        for row in curriculum[:20]:
+            lesson = str(row.get("lesson") or "").strip()
+            title_text = str(row.get("title") or "").strip()
+            briefing = str(row.get("briefing") or "").strip()
+            prefix = f"Lesson {lesson}: " if lesson else ""
+            lines.append(f"- {prefix}{title_text}" + (f" — {briefing}" if briefing else ""))
+        lines.append("")
+
     lines.append("## Writer role guard")
     lines.append("- 글의 주체는 크롤러/AI 시스템 개발자가 아니라 학습자다.")
     lines.append("- 문제는 수집기 구현 문제가 아니라 학습 중 어렵거나 복잡했던 개념, 실습, 비교, 원리 이해 지점이다.")
@@ -307,6 +329,12 @@ def build_article_brief(graph: dict[str, Any], items: list[EvidenceItem]) -> str
     for t in top_titles:
         lines.append(f"- {t}")
     lines.append("")
+
+    if curriculum:
+        lines.append("## Multi-keyword focus guidance")
+        lines.append("- 커리큘럼형 페이지에서는 단일 키워드 하나보다, 과정 전체를 관통하는 4~8개 핵심 축을 함께 사용한다.")
+        lines.append("- 예: 환경 준비, 지식 원천, agent 유형, 대화 라우팅, UI 입력, 자동화, 배포, 권한/라이선스.")
+        lines.append("")
 
     return "\n".join(lines)
 
