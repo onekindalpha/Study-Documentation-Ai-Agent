@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# v4.7.24 source_first_explicit_topic_guard
 # v4.7.23 nonit_source_first_polish
 # v4.7.22 single_page_source_first_gate
 # v4.7.21 source_first_marker_and_router_fix
@@ -1360,6 +1361,7 @@ INTERNAL_ARTICLE_BANNED_PHRASES = [
     "why selected",
 ]
 
+# v4.7.25 transcript_ux_and_rag_guard
 CROSS_RUN_CONTAMINATION_TERMS = [
     "agent orchestration", "orchestrator", "sub-agent", "sub-agents", "github copilot cli",
     "planner", "coder", "designer", "toolchain", "rag", "mcp", "model context protocol",
@@ -1739,6 +1741,33 @@ def source_first_policy_failures(article: str, current_text: str = "", seed_url:
 
     return failures
 
+def contains_contamination_term(text: str, term: str) -> bool:
+    """Return True only for real stale-topic terms, not substrings.
+
+    v4.7.25: a term such as ``rag`` must not match ordinary words like
+    ``storage``.  Treat ASCII terms as token/phrase matches with word
+    boundaries, while keeping simple substring matching for Korean/non-ASCII
+    phrases where word boundaries are less reliable.
+    """
+    haystack = str(text or "").lower()
+    needle = str(term or "").lower().strip()
+    if not needle:
+        return False
+    if re.fullmatch(r"[a-z0-9 _./+-]+", needle):
+        pattern = r"(?<![a-z0-9_])" + re.escape(needle).replace(r"\ ", r"\s+") + r"(?![a-z0-9_])"
+        return re.search(pattern, haystack) is not None
+    return needle in haystack
+
+
+def contamination_hits(article_text: str, current_text: str = "", seed_url: str = "") -> list[str]:
+    current_blob = f"{current_text}\n{seed_url}".lower()
+    hits: list[str] = []
+    for term in CROSS_RUN_CONTAMINATION_TERMS:
+        if contains_contamination_term(article_text, term) and not contains_contamination_term(current_blob, term):
+            hits.append(term)
+    return hits
+
+
 def final_article_policy_failures(article: str, current_text: str = "", seed_url: str = "") -> list[str]:
     text = str(article or "")
     lowered = text.lower()
@@ -1746,9 +1775,8 @@ def final_article_policy_failures(article: str, current_text: str = "", seed_url
     leaked = [phrase for phrase in INTERNAL_ARTICLE_BANNED_PHRASES if phrase and phrase.lower() in lowered]
     if leaked:
         failures.append("internal/placeholder terms leaked: " + ", ".join(leaked[:8]))
-    current_blob = f"{current_text}\n{seed_url}".lower()
-    contamination = [term for term in CROSS_RUN_CONTAMINATION_TERMS if term in lowered and term not in current_blob]
-    # Do not block generic agent/RAG words when the current URL/text actually contains them.
+    contamination = contamination_hits(text, current_text=current_text, seed_url=seed_url)
+    # v4.7.25: use token/phrase matching so RAG does not match storage.
     if contamination:
         failures.append("possible stale-run topic contamination: " + ", ".join(contamination[:8]))
     # v4.7.19: source-first fallback articles are intentionally generated from
@@ -2172,6 +2200,38 @@ def collector_execution_failure_report(seed_url: str, run_id: str, collector_rep
 def collection_failure_report(seed_url: str, run_id: str, collector_report: dict[str, Any], reasons: list[str]) -> str:
     graph_md = source_graph_markdown(seed_url, run_id, collector_report)
     reason_md = "\n".join(f"- {reason}" for reason in reasons) or "- 수집 품질 기준 미달"
+    host = url_domain(seed_url)
+
+    # v4.7.25: users cannot know whether a visible YouTube caption is
+    # programmatically extractable. Give actionable alternatives instead of
+    # merely asking for a "captioned video".
+    if "youtube.com" in host or "youtu.be" in host:
+        return f"""# YouTube 자막 자동수집 실패
+
+이 영상은 화면에서 자막이 보일 수 있어도, 앱이 프로그램으로 읽을 수 있는 transcript/caption 본문을 가져오지 못했습니다. 제목만 보고 글을 만들면 실제 영상 내용과 다른 글이 생성될 수 있으므로 중단했습니다.
+
+## 입력 URL
+- {seed_url}
+
+## run_id
+{run_id}
+
+## 중단 이유
+{reason_md}
+
+## 수집 상태
+```text
+{graph_md}
+```
+
+## 다음 조치
+- YouTube 화면에서 **스크립트 표시 / Show transcript**가 보이면 전체 자막을 복사해서 메모/본문 입력에 붙여넣어 주세요.
+- TED 영상이면 YouTube URL 대신 **TED 공식 talk/transcript 페이지 URL**을 넣어 주세요.
+- 자막 복사가 어렵다면 핵심 내용을 직접 메모로 적어 주세요.
+- 화면 위주 강의라면 영상 URL 대신 주요 장면을 캡처 이미지로 업로드해 이미지 기반 글쓰기 모드로 작성해 주세요.
+- 다른 영상 URL을 넣어도 됩니다. 단, 앱이 자동으로 transcript를 읽을 수 있어야 URL만으로 글 생성이 가능합니다.
+"""
+
     return f"""# Source Graph 수집 부족
 
 대표 URL 안의 학습 내용을 충분히 수집하지 못해서 Medium 글 생성을 중단했습니다.
@@ -2191,10 +2251,10 @@ def collection_failure_report(seed_url: str, run_id: str, collector_report: dict
 ```
 
 ## 다음 조치
-- 대표 URL 내부의 목차/하위 페이지/Lab/영상/자막이 source graph에 들어와야 합니다.
+- 단일 문서라면 본문이 충분히 수집되어야 합니다.
+- 강의/영상이라면 자막, transcript, 강의 메모, 또는 캡처 이미지가 필요합니다.
 - 이 상태에서 글을 생성하면 제목이나 일반 키워드만 보고 추상적인 글이 만들어지므로 차단했습니다.
 """
-
 
 def seed_mismatch_report(seed_url: str, run_id: str, collector_report: dict[str, Any], reason: str) -> str:
     graph_md = source_graph_markdown(seed_url, run_id, collector_report)
@@ -2927,6 +2987,13 @@ def source_first_fallback_profile(seed_url: str, title: str, body_text: str, use
     raw_title = re.sub(r"\s+", " ", str(title or "")).strip()
     user_problem_clean = clean_prompt_memo(user_problem)
     source_blob = f"{raw_title}\n{user_problem_clean}\n{str(body_text or '')[:6000]}"
+    # v4.7.24: topic selection must come from the explicit current input
+    # (title + user memo), not from incidental body mentions.  Otherwise a
+    # Memory page that mentions sleep can accidentally reuse the sleep contract,
+    # or a Procrastination page that mentions time management can become a time
+    # management article.
+    explicit_blob = f"{raw_title}\n{user_problem_clean}"
+    explicit_l = explicit_blob.lower()
     if not raw_title and len(source_blob.strip()) < 300:
         return None
 
@@ -2991,12 +3058,13 @@ def source_first_fallback_profile(seed_url: str, title: str, body_text: str, use
         if len(terms) >= 8:
             break
 
-    # Current-source derived special case, not a reusable topic template: MDN Array.map
-    # exposes a strong code example in title/memo.  This keeps code usefulness
-    # without borrowing FastAPI/NumPy profiles.
+    # Current-source derived special cases, not reusable templates:
+    # they are allowed only when the current title/user memo clearly identify
+    # that topic.  Body text is still used for evidence, but not for picking a
+    # different topic contract.
     code_example = ""
     concept_desc_overrides: dict[str, str] = {}
-    if ("array.prototype.map" in blob_l or "array map" in blob_l or "callback" in blob_l) and "new array" in blob_l:
+    if ("array.prototype.map" in explicit_l or "array map" in explicit_l or "array.map" in explicit_l) and ("new array" in explicit_l or "callback" in explicit_l):
         subject = "JavaScript Array map"
         preferred = ["Array.map", "callback", "return value", "original array", "new array", "iteration"]
         terms = preferred[:]
@@ -3020,7 +3088,44 @@ console.log(doubled); // [2, 8, 18, 32]
 
 `callback`은 각 요소를 받아 새 값을 반환하고, `map()`은 그 반환값들을 모아 `new array`를 만든다. 원본 배열과 결과 배열을 비교하는 것이 핵심 검증 기준이다."""
 
-    if "시간 관리" in source_blob or "time management" in blob_l:
+    if "스트레스" in explicit_blob or "stress" in explicit_l:
+        subject = "스트레스"
+        preferred = ["스트레스 요인", "신체 반응", "심리적 반응", "적응", "회복 기준"]
+        terms = preferred[:]
+        concept_desc_overrides = {
+            "스트레스 요인": "긴장이나 압박을 유발하는 외부·내부 자극이다.",
+            "신체 반응": "스트레스 요인에 대해 몸에서 나타나는 생리적 변화다.",
+            "심리적 반응": "스트레스 상황에서 감정·인지·주의가 달라지는 반응이다.",
+            "적응": "자극에 대응하며 상태를 조절해 가는 과정이다.",
+            "회복 기준": "긴장 이후 다시 안정 상태로 돌아왔는지 확인하는 판단 기준이다.",
+        }
+
+    if "기억" in explicit_blob or "memory" in explicit_l:
+        subject = "기억"
+        preferred = ["기억 형성", "입력", "저장", "인출", "회상", "망각"]
+        terms = preferred[:]
+        concept_desc_overrides = {
+            "기억 형성": "정보가 경험으로 들어와 기억으로 만들어지는 과정이다.",
+            "입력": "외부 정보를 받아들이는 첫 단계다.",
+            "저장": "받아들인 정보를 일정 기간 유지하는 과정이다.",
+            "인출": "저장된 정보를 필요할 때 다시 꺼내 쓰는 과정이다.",
+            "회상": "기억한 내용을 의식적으로 떠올리는 행위다.",
+            "망각": "저장되었거나 입력된 정보를 다시 떠올리지 못하는 상태다.",
+        }
+
+    if "미루기" in explicit_blob or "procrastination" in explicit_l:
+        subject = "미루기"
+        preferred = ["과제 회피", "즉각적 보상", "마감 압박", "실행 지연", "실행 전략"]
+        terms = preferred[:]
+        concept_desc_overrides = {
+            "과제 회피": "해야 할 일을 바로 시작하지 않고 피하는 행동 패턴이다.",
+            "즉각적 보상": "장기 목표보다 당장 편하거나 즐거운 선택에 끌리는 요인이다.",
+            "마감 압박": "기한이 가까워질수록 행동을 강제로 전환시키는 압력이다.",
+            "실행 지연": "계획은 있으나 실제 행동으로 옮기는 시점이 늦어지는 상태다.",
+            "실행 전략": "회피를 줄이고 행동 시작을 쉽게 만드는 구체적 기준이다.",
+        }
+
+    if "시간 관리" in explicit_blob or "time management" in explicit_l:
         subject = "시간 관리"
         preferred = ["우선순위", "시간 블록", "마감", "실행 기준", "계획", "시간 배분"]
         terms = preferred[:]
@@ -3033,10 +3138,7 @@ console.log(doubled); // [2, 8, 18, 32]
             "시간 배분": "제한된 시간을 여러 과업에 나누어 사용하는 관리 방식이다.",
         }
 
-    # v4.7.23: non-IT source-first smoke tests.  These are not broad templates;
-    # they only keep the article contract faithful to the current source/memo
-    # instead of letting fragmented keywords create odd flows like "수면의 검증".
-    if ("수면" in source_blob or "잠 - 위키" in source_blob or "sleep" in blob_l) and any(x in source_blob for x in ["수면", "회복", "리듬", "sleep"]):
+    if ("수면" in explicit_blob or "잠 - 위키" in explicit_blob or "sleep" in explicit_l) and any(x in explicit_blob for x in ["수면", "회복", "리듬", "잠"]):
         subject = "수면"
         preferred = ["수면 시간", "수면의 질", "수면 주기", "회복 기준", "생활 리듬"]
         terms = preferred[:]
@@ -3048,7 +3150,7 @@ console.log(doubled); // [2, 8, 18, 32]
             "생활 리듬": "수면과 각성 시간이 반복되며 하루 생활 패턴을 만드는 흐름이다.",
         }
 
-    if "습관" in source_blob and any(x in source_blob for x in ["반복", "보상", "환경", "행동"]):
+    if "습관" in explicit_blob and any(x in explicit_blob for x in ["반복", "보상", "환경", "행동", "신호"]):
         subject = "습관"
         preferred = ["습관 형성", "행동 반복", "신호", "보상", "환경 설계"]
         terms = preferred[:]
@@ -3060,7 +3162,7 @@ console.log(doubled); // [2, 8, 18, 32]
             "환경 설계": "원하는 행동이 쉽게 반복되도록 주변 조건을 조정하는 방식이다.",
         }
 
-    if ("cue" in blob_l and "routine" in blob_l and "reward" in blob_l) or "habit loop" in blob_l:
+    if ("cue" in explicit_l and "routine" in explicit_l and "reward" in explicit_l) or "habit loop" in blob_l:
         subject = "Habit formation"
         preferred = ["cue", "routine", "reward", "environment", "environment design"]
         terms = preferred[:]
@@ -3126,6 +3228,12 @@ console.log(doubled); // [2, 8, 18, 32]
             if subject == "수면" else
             "습관 학습 기록: 행동 반복과 환경 설계 구분하기"
             if subject == "습관" else
+            "스트레스 학습 기록: 자극·반응·회복 기준 구분하기"
+            if subject == "스트레스" else
+            "기억 학습 기록: 입력·저장·인출 흐름 구분하기"
+            if subject == "기억" else
+            "미루기 학습 기록: 과제 회피와 실행 전환 구분하기"
+            if subject == "미루기" else
             "Habit formation 학습 기록: cue-routine-reward 흐름 이해하기"
             if subject == "Habit formation" else
             f"{subject} 학습 기록: 본문 안에서 핵심 개념 구분하기"
@@ -3139,6 +3247,12 @@ console.log(doubled); // [2, 8, 18, 32]
             if subject == "수면" else
             "Clarifying habit formation, repetition, reward, and environment design"
             if subject == "습관" else
+            "Clarifying stressors, responses, adaptation, and recovery criteria"
+            if subject == "스트레스" else
+            "Clarifying encoding, storage, retrieval, recall, and forgetting"
+            if subject == "기억" else
+            "Clarifying avoidance, instant reward, deadline pressure, and execution strategy"
+            if subject == "미루기" else
             "Clarifying cue, routine, reward, and environment design"
             if subject == "Habit formation" else
             "Deriving the learning problem from the page itself"
