@@ -1,4 +1,4 @@
-# Study Capture Copilot
+# AI Study Documentation Agent
 
 Lecture capture-to-technical blog generation service that turns screenshots, course URLs, lab instructions, and rough notes into problem-solving Medium-style drafts.
 
