@@ -1,3 +1,13 @@
+---
+title: Study Documentation Automation AI Agent
+emoji: 📝
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7870
+pinned: false
+---
+
 # Study Documentation Automation Ai Agent
 
 **Language:** English | [한국어](./README.ko.md)
