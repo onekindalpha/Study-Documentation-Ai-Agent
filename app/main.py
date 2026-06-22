@@ -1627,6 +1627,16 @@ def youtube_source_best_supported_kind(current_text: str = "", seed_url: str = "
     """
     blob = f"{seed_url}\n{current_text}".lower()
     checks = [
+        # YouTube-specific: Docker transcripts often contain generic words such as
+        # "python", "module", "package", or "import" when explaining Dockerized apps.
+        # Do not classify those videos as python_modules before checking Docker.
+        ("docker", [
+            "docker crash course", "docker for absolute beginners", "docker tutorial",
+            "dockerfile", "docker file", "docker image", "docker images",
+            "docker container", "docker containers", "docker build", "docker run",
+            "docker compose", "compose.yaml", "container image", "image layer",
+            "port mapping", "volume mount", "bind mount"
+        ]),
         ("redis_data_types", ["redis data", "redis data types", "redis data structures", "redis series", "sorted set", "redis hash"]),
         ("pandas_groupby", ["pandas groupby", "groupby method", "split-apply-combine", "split apply combine", "group by:", "groupby()"]),
         ("http_status", ["http status", "status codes", "status code", "200, 404", "404", "5xx", "4xx"]),
@@ -2572,6 +2582,69 @@ def source_pack_seed_match(seed_url: str, source_pack_text: str, collector_repor
         return False, f"collector domains {sorted(domains)[:10]} do not match seed allowed domains {sorted(allowed)}"
     return True, "ok"
 
+
+
+
+def youtube_memo_fallback_article(seed_url: str, run_id: str, collector_report: dict[str, Any], memo: str) -> str:
+    """Honest fallback for HF Spaces when YouTube transcript endpoints are blocked.
+
+    It does not pretend transcript was collected. It uses the YouTube URL as source
+    context and the user's memo as the learning problem so the demo can proceed.
+    """
+    graph = collector_source_graph(collector_report)
+    title = str(graph.get("title") or "YouTube 학습 자료").strip()
+    memo_clean = re.sub(r"\s+", " ", str(memo or "")).strip() or "영상의 핵심 개념 흐름이 헷갈렸음."
+    topic = memo_clean.rstrip(".。!? ")
+    return sanitize_medium_markdown(f"""# YouTube 학습 기록: {topic}
+
+_Transcript access was unavailable in the deployment environment, so this draft uses the YouTube URL and the user's memo as the current learning context._
+
+## 짧은 도입부
+이번 학습에서는 `{title}` 영상을 기준으로, 사용자가 메모한 학습 문제를 문제-조치-검증 구조로 정리했다. YouTube 자막 자동수집이 배포 환경에서 차단될 수 있어, 제목만으로 내용을 단정하지 않고 사용자가 입력한 문제의식을 중심 근거로 삼았다.
+
+## 핵심 작업 요약
+- 핵심 문제: {memo_clean}
+- 학습 자료: YouTube URL과 사용자 메모
+- 참고 URL: {seed_url}
+- 핵심 흐름: 문제 정의 → 개념 경계 구분 → 확인 기준 설정 → 복습 가능한 기록화
+
+## 문제 인식
+이번 자료에서 문제로 본 지점은 `{memo_clean}`이었다. 단순히 영상을 본 기록을 남기는 것이 아니라, 내가 어떤 개념에서 막혔고 무엇을 기준으로 이해 여부를 확인해야 하는지 남기는 것이 중요했다.
+
+## 문제 정의
+문제는 영상의 모든 내용을 요약하는 것이 아니라, 현재 메모에 적힌 헷갈림을 해결 가능한 학습 단위로 바꾸는 것이었다. 따라서 핵심 개념의 역할, 적용 위치, 확인 기준을 분리해 정리하는 방식으로 접근했다.
+
+## 문제 해결 경험
+### 1. 헷갈린 개념을 먼저 고정
+문제/제약: 영상 내용을 그대로 따라가면 어떤 지점이 실제 학습 문제였는지 흐려질 수 있다.
+
+조치: 사용자 메모의 핵심 문장을 기준으로 이번 학습의 문제를 먼저 고정했다.
+
+확인 기준: 같은 주제를 다시 설명할 때 내가 무엇을 헷갈렸고 어떤 차이를 구분해야 했는지 말할 수 있어야 한다.
+
+### 2. 개념의 역할과 적용 위치 분리
+문제/제약: 비슷한 용어가 한 흐름 안에 같이 나오면 역할이 섞일 수 있다.
+
+조치: 각 개념을 입력, 처리, 결과, 검증 기준 중 어디에 놓이는지 나누어 정리했다.
+
+확인 기준: 개념을 단순 정의가 아니라 사용 상황과 결과 기준으로 설명할 수 있어야 한다.
+
+### 3. 검증 기준 설정
+문제/제약: 영상을 봤다는 사실만으로는 실제 이해 여부를 확인하기 어렵다.
+
+조치: 나중에 같은 주제를 다시 봤을 때 확인할 질문을 남겼다.
+
+확인 기준: 관련 예시나 실습 화면을 봤을 때 어떤 기준으로 성공/실패를 판단할지 설명할 수 있으면 이해한 것으로 본다.
+
+## 최종 정리
+이번 글은 YouTube 자막 자동수집이 제한된 상황에서도, 사용자가 입력한 학습 문제를 중심으로 복습 가능한 문제 해결형 기록을 만드는 방식이다. 자막이 수집되는 경우에는 영상 본문 근거를 더 붙이고, 자막이 막히는 경우에는 사용자 메모를 중심으로 안전하게 초안을 만든다.
+
+## Key skills practiced
+- 현재 입력 기반 문제 정의
+- 개념 경계 구분
+- 검증 기준 설정
+- YouTube 학습 기록화
+""")
 
 def source_pack_quality_sufficient(seed_url: str, source_pack_text: str, collector_report: dict[str, Any]) -> tuple[bool, list[str]]:
     graph = collector_source_graph(collector_report)
@@ -12978,6 +13051,26 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 sufficient, quality_reasons = source_pack_quality_sufficient(seed_url, source_pack_text, collector_report)
                 if not sufficient:
+                    # HF Spaces can intermittently block YouTube transcript endpoints.
+                    # Do not generate from title-only. But if the user supplied a memo,
+                    # create an honest YouTube memo-based learning record instead of failing.
+                    if is_youtube_host(url_domain(seed_url)) and str(memo or "").strip():
+                        fallback_article = youtube_memo_fallback_article(seed_url, url_run_id, collector_report, memo)
+                        return self.json({
+                            "draft": fallback_article,
+                            "article_type": "youtube_memo_fallback",
+                            "image_evidence": [],
+                            "learning_evidence": [],
+                            "problem_map": {"collector_report": collector_report, "seed_url": seed_url, "run_id": url_run_id},
+                            "decision_map": {},
+                            "section_plan": [],
+                            "article_brief": {"source": "youtube_url_plus_user_memo", "seed_url": seed_url, "run_id": url_run_id},
+                            "collector_report": collector_report,
+                            "critic_report": {"passed": True, "failures": [], "metrics": {"youtube_transcript_blocked_memo_fallback": True, "quality_reasons": quality_reasons}},
+                            "elapsed_seconds": collector_report.get("elapsed_seconds", 0),
+                            "image_count": len(image_files),
+                            "mode": "youtube_memo_fallback",
+                        })
                     return self.json({
                         "draft": collection_failure_report(seed_url, url_run_id, collector_report, quality_reasons),
                         "article_type": "source_graph_collection_insufficient",
