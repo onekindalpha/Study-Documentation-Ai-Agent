@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import tempfile
 import urllib.request
 from urllib.parse import parse_qs, quote, urlparse
 from typing import Any
@@ -45,6 +48,123 @@ def fetch_oembed_title(url: str) -> str:
             return data.get("title") or ""
         except Exception:
             return ""
+
+
+
+
+def _segments_from_json3(path: str) -> list[dict[str, Any]]:
+    data = json.loads(open(path, "r", encoding="utf-8", errors="replace").read())
+    out: list[dict[str, Any]] = []
+    for event in data.get("events", []) if isinstance(data, dict) else []:
+        parts: list[str] = []
+        for seg in event.get("segs", []) or []:
+            text = str(seg.get("utf8") or "")
+            if text:
+                parts.append(text)
+        text = "".join(parts).replace("\n", " ").strip()
+        if not text:
+            continue
+        start = float(event.get("tStartMs") or 0) / 1000.0
+        duration = float(event.get("dDurationMs") or 0) / 1000.0
+        out.append({"text": text, "start": start, "duration": duration})
+    return out
+
+
+def _segments_from_vtt(path: str) -> list[dict[str, Any]]:
+    timestamp_re = re.compile(r"(\d\d:)?\d\d:\d\d\.\d{3}\s+-->\s+(\d\d:)?\d\d:\d\d\.\d{3}")
+    out: list[dict[str, Any]] = []
+    current: list[str] = []
+    for raw in open(path, "r", encoding="utf-8", errors="replace"):
+        line = raw.strip()
+        if not line or line.upper().startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+            if current:
+                text = " ".join(current).strip()
+                if text:
+                    out.append({"text": text, "start": 0.0, "duration": 0.0})
+                current = []
+            continue
+        if timestamp_re.search(line) or re.fullmatch(r"\d+", line):
+            if current:
+                text = " ".join(current).strip()
+                if text:
+                    out.append({"text": text, "start": 0.0, "duration": 0.0})
+                current = []
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"&[a-zA-Z#0-9]+;", " ", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            current.append(line)
+    if current:
+        text = " ".join(current).strip()
+        if text:
+            out.append({"text": text, "start": 0.0, "duration": 0.0})
+    return out
+
+
+def fetch_transcript_with_ytdlp(video_id: str, languages: list[str] | None = None) -> list[dict[str, Any]]:
+    """Fallback for recorded livestreams where youtube-transcript-api cannot read captions.
+
+    Some YouTube Live recordings expose auto captions to yt-dlp even when
+    youtube-transcript-api reports transcript unavailable.  We only return real
+    subtitle/caption text; if yt-dlp cannot download subtitles, the caller should
+    keep blocking Medium generation rather than hallucinating from the title.
+    """
+    languages = languages or ["ko", "en.*", "en", "ja"]
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory(prefix="study_capture_ytdlp_") as tmp:
+        out_tpl = os.path.join(tmp, "%(id)s.%(ext)s")
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            ",".join(languages),
+            "--sub-format",
+            "json3/vtt/srv3/best",
+            "-o",
+            out_tpl,
+            url,
+        ]
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "yt-dlp subtitle download failed").strip()[:800])
+
+        subtitle_files: list[str] = []
+        for root, _dirs, files in os.walk(tmp):
+            for name in files:
+                lower = name.lower()
+                if lower.endswith((".json3", ".vtt", ".srv3")):
+                    subtitle_files.append(os.path.join(root, name))
+        if not subtitle_files:
+            raise RuntimeError("yt-dlp did not download subtitle files")
+
+        # Prefer Korean, then English, then any available caption file.
+        def score(path: str) -> tuple[int, int]:
+            name = os.path.basename(path).lower()
+            lang_score = 0
+            if ".ko" in name or "-ko" in name:
+                lang_score = 0
+            elif ".en" in name or "-en" in name:
+                lang_score = 1
+            else:
+                lang_score = 2
+            fmt_score = 0 if name.endswith(".json3") else 1 if name.endswith(".vtt") else 2
+            return (lang_score, fmt_score)
+
+        for path in sorted(subtitle_files, key=score):
+            try:
+                if path.lower().endswith(".json3"):
+                    segments = _segments_from_json3(path)
+                else:
+                    segments = _segments_from_vtt(path)
+                segments = [seg for seg in segments if not is_noise_segment(str(seg.get("text") or ""))]
+                if len(" ".join(str(seg.get("text") or "") for seg in segments)) >= 500:
+                    return segments
+            except Exception:
+                continue
+        raise RuntimeError("yt-dlp subtitles were downloaded but no usable transcript text was parsed")
 
 
 def fetch_transcript(video_id: str, languages: list[str] | None = None) -> list[dict[str, Any]]:
@@ -100,6 +220,11 @@ def fetch_transcript(video_id: str, languages: list[str] | None = None) -> list[
 
     except Exception as exc:
         errors.append(f"api.list={type(exc).__name__}: {exc}")
+
+    try:
+        return fetch_transcript_with_ytdlp(video_id, languages=languages)
+    except Exception as exc:
+        errors.append(f"yt-dlp={type(exc).__name__}: {exc}")
 
     raise RuntimeError("transcript not available: " + " | ".join(errors))
 
